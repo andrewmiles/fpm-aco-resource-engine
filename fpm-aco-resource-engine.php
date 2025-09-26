@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync, and content models.
- * Version:         1.15.0
+ * Version:         1.15.1
  * GitHub Plugin URI: andrewmiles/fpm-aco-resource-engine
  * Primary Branch: main
  * Author:          FPM
