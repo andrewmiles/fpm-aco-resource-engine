@@ -53,6 +53,8 @@ add_filter('acf/settings/remove_wp_meta_box', '__return_false');
 // --- Activation / Deactivation / Uninstall Hooks ---
 
 register_activation_hook( __FILE__, function () {
+    update_option('aco_re_activation_test', time()); // <-- ADD THIS LINE
+
     // Call the function to create the table
     aco_re_create_sync_log_table(); 
 
