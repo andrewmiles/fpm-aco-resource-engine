@@ -28,34 +28,6 @@ if ( ! defined( 'ACO_AT_LAST_MODIFIED_MS_META' ) ) {
 }
 
 
-// --- Hook Registrations ---
-add_action( 'admin_init', 'aco_re_register_settings' );
-add_action( 'admin_init', 'aco_re_register_tag_governance_settings' );
-add_action( 'admin_init', 'aco_re_handle_manual_tag_refresh' );
-add_action( 'plugins_loaded', 'aco_re_load_text_domain' );
-add_action( 'init', 'aco_re_register_content_models' );
-add_action( 'init', 'aco_re_seed_terms_conditionally', 20 );
-add_action( 'init', 'aco_re_ensure_admin_capability', 1 );
-add_action( 'admin_menu', 'aco_re_register_settings_page' );
-add_action( 'admin_enqueue_scripts', 'aco_re_enqueue_linter_script' );
-add_action( 'wp_dashboard_setup', 'aco_re_register_dashboard_widget' );
-add_action( 'aco_re_hourly_tag_sync_hook', 'aco_re_refresh_tag_allowlist' );
-add_action( 'rest_api_init', 'aco_re_register_webhook_endpoint' );
-add_action( 'aco_re_process_resource_sync', 'aco_re_process_resource_sync_action' );
-
-add_filter( 'rest_pre_insert_resource', 'aco_re_validate_tags_on_rest_save', 10, 2 );
-add_filter( 'wp_get_attachment_url', 'aco_re_failover_url_swap', 99 );
-add_filter( 'wp_calculate_image_srcset', 'aco_re_failover_srcset_swap', 99 );
-add_filter( 'wp_get_attachment_image_attributes', 'aco_re_failover_img_attr_swap', 99 );
-add_filter( 'site_status_tests', 'aco_re_add_site_health_test' );
-add_action('init', function() {
-    // First, check if ACF Pro is active to prevent errors if it's disabled.
-    if (function_exists('acf_is_pro') && acf_is_pro()) {
-        // Add the filter, now that we know it's safe to do so.
-        add_filter('acf/settings/remove_wp_meta_box', '__return_false');
-    }
-});
-
 // --- Activation / Deactivation / Uninstall Hooks ---
 
 register_activation_hook( __FILE__, function () {
@@ -1136,3 +1108,30 @@ function aco_re_process_resource_sync_action( $payload ) {
         aco_re_release_lock( $record_id );
     }
 }
+// --- Hook Registrations ---
+add_action( 'admin_init', 'aco_re_register_settings' );
+add_action( 'admin_init', 'aco_re_register_tag_governance_settings' );
+add_action( 'admin_init', 'aco_re_handle_manual_tag_refresh' );
+add_action( 'plugins_loaded', 'aco_re_load_text_domain' );
+add_action( 'init', 'aco_re_register_content_models' );
+add_action( 'init', 'aco_re_seed_terms_conditionally', 20 );
+add_action( 'init', 'aco_re_ensure_admin_capability', 1 );
+add_action( 'admin_menu', 'aco_re_register_settings_page' );
+add_action( 'admin_enqueue_scripts', 'aco_re_enqueue_linter_script' );
+add_action( 'wp_dashboard_setup', 'aco_re_register_dashboard_widget' );
+add_action( 'aco_re_hourly_tag_sync_hook', 'aco_re_refresh_tag_allowlist' );
+add_action( 'rest_api_init', 'aco_re_register_webhook_endpoint' );
+add_action( 'aco_re_process_resource_sync', 'aco_re_process_resource_sync_action' );
+
+add_filter( 'rest_pre_insert_resource', 'aco_re_validate_tags_on_rest_save', 10, 2 );
+add_filter( 'wp_get_attachment_url', 'aco_re_failover_url_swap', 99 );
+add_filter( 'wp_calculate_image_srcset', 'aco_re_failover_srcset_swap', 99 );
+add_filter( 'wp_get_attachment_image_attributes', 'aco_re_failover_img_attr_swap', 99 );
+add_filter( 'site_status_tests', 'aco_re_add_site_health_test' );
+add_action('init', function() {
+    // First, check if ACF Pro is active to prevent errors if it's disabled.
+    if (function_exists('acf_is_pro') && acf_is_pro()) {
+        // Add the filter, now that we know it's safe to do so.
+        add_filter('acf/settings/remove_wp_meta_box', '__return_false');
+    }
+});
