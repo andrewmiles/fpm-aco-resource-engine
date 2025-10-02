@@ -28,11 +28,13 @@ fi
 
 echo ""
 echo "--- Release Successful, Starting Deployment ---"
+echo "Using 'tar' to deploy as rsync is not available on the remote server..."
 
-# Deploy the plugin using rsync
-/opt/homebrew/bin/rsync -avz --exclude='.git' --exclude='*.sh' ./ acomain@5.134.12.230:/home/acomain/public_html/wp-content/plugins/fpm-aco-resource-engine/
+# This command archives the local files, sends them over SSH, and unpacks them on the server.
+# Exclusions for .git, .sh files, and the .venv directory are included.
+tar --exclude='.git' --exclude='*.sh' --exclude='.venv' -czf - . | ssh acomain@5.134.12.230 "mkdir -p /home/acomain/public_html/wp-content/plugins/fpm-aco-resource-engine && tar -xzf - -C /home/acomain/public_html/wp-content/plugins/fpm-aco-resource-engine"
 
-# Capture the exit code from rsync
+# Capture the exit code from the deployment command
 DEPLOY_EXIT_CODE=$?
 
 echo ""
