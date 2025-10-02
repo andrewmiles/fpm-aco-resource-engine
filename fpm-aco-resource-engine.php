@@ -2,8 +2,8 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.1
- * Author:          FPM
+ * Version:         1.17.4
+ * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
  * License:         GPL v2 or later
@@ -1173,46 +1173,7 @@ add_action('plugins_loaded', function() {
     }
 });
 
-<?php
 // --- START: ACO Sync Log Admin Viewer ---
-
-// 1. Register the admin page under the "Tools" menu.
-function aco_re_register_log_viewer_page() {
-    $hook_suffix = add_management_page(
-        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
-        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
-        'manage_options',
-        'aco-sync-log',
-        'aco_re_render_log_viewer_page'
-    );
-    // Action to add screen options
-    add_action( "load-{$hook_suffix}", 'aco_re_log_viewer_screen_options' );
-}
-add_action( 'admin_menu', 'aco_re_register_log_viewer_page' );
-
-// 2. Render the admin page.
-function aco_re_render_log_viewer_page() {
-    // Re-check capability as a defense-in-depth measure.
-    if ( ! current_user_can( 'manage_options' ) ) {
-        wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'fpm-aco-resource-engine' ) );
-    }
-
-    $log_list_table = new ACO_Sync_Log_List_Table();
-    $log_list_table->prepare_items();
-    ?>
-    <div class="wrap">
-        <h1 class="wp-heading-inline"><?php esc_html_e( 'Airtable to WP Sync Log', 'fpm-aco-resource-engine' ); ?></h1>
-        <p><?php esc_html_e( 'This log shows the history of operations triggered by Airtable.', 'fpm-aco-resource-engine' ); ?></p>
-        <form method="get">
-            <input type="hidden" name="page" value="<?php echo isset( $_REQUEST['page'] ) ? esc_attr( $_REQUEST['page'] ) : ''; ?>" />
-            <?php
-            $log_list_table->search_box( __( 'Search Logs', 'fpm-aco-resource-engine' ), 'aco-sync-log-search' );
-            $log_list_table->display();
-            ?>
-        </form>
-    </div>
-    <?php
-}
 
 // 3. Add Screen Options
 function aco_re_log_viewer_screen_options() {
@@ -1228,11 +1189,14 @@ function aco_re_log_viewer_screen_options() {
 }
 
 
-// 4. Create the WP_List_Table class for our log.
+// 4. Ensure WP_List_Table is available.
 if ( ! class_exists( 'WP_List_Table' ) ) {
     require_once ABSPATH . 'wp-admin/includes/class-wp-list-table.php';
 }
 
+/**
+ * Consolidated list table with Replay support.
+ */
 class ACO_Sync_Log_List_Table extends WP_List_Table {
 
     public function __construct() {
@@ -1383,13 +1347,13 @@ class ACO_Sync_Log_List_Table extends WP_List_Table {
     public function column_message( $item ) {
         $raw_data = $item['message'] ?? '';
         $data = aco_re_safe_parse_message( $raw_data );
-        $message = isset( $data['message'] ) && is_string( $data['message'] )
-                   ? $data['message']
+        $message = isset( $data['message'] ) && is_string( $data['message'] ) 
+                   ? $data['message'] 
                    : __( 'Could not read message.', 'fpm-aco-resource-engine' );
 
         return esc_html( $message );
     }
-
+    
     public function column_record_id( $item ) {
         $record_id = isset( $item['record_id'] ) ? esc_html( $item['record_id'] ) : '';
         $actions = [];
@@ -1397,11 +1361,11 @@ class ACO_Sync_Log_List_Table extends WP_List_Table {
         $status = $item['status'] ?? '';
         if ( in_array( $status, [ 'failed', 'error' ], true ) && ! empty( $item['id'] ) ) {
             $replay_url = wp_nonce_url( add_query_arg( [
-                'page'     => 'aco-sync-log',
-                'action'   => 'replay',
-                'log_id'   => $item['id'],
+                'page'    => 'aco-sync-log',
+                'action'  => 'replay',
+                'log_id'  => $item['id'],
             ], admin_url( 'tools.php' ) ), 'aco_replay_log_' . $item['id'] );
-
+            
             $actions['replay'] = sprintf( '<a href="%s">%s</a>', esc_url( $replay_url ), __( 'Replay', 'fpm-aco-resource-engine' ) );
         }
 
@@ -1409,6 +1373,43 @@ class ACO_Sync_Log_List_Table extends WP_List_Table {
     }
 }
 
+// 1. Register the admin page under the "Tools" menu. (Consolidated)
+function aco_re_register_log_viewer_page() {
+    $hook_suffix = add_management_page(
+        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
+        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
+        'manage_options',
+        'aco-sync-log',
+        'aco_re_render_log_viewer_page'
+    );
+    // Action to add screen options
+    add_action( "load-{$hook_suffix}", 'aco_re_log_viewer_screen_options' );
+}
+add_action( 'admin_menu', 'aco_re_register_log_viewer_page' );
+
+// 2. Render the admin page. (Consolidated)
+function aco_re_render_log_viewer_page() {
+    // Re-check capability as a defense-in-depth measure.
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'fpm-aco-resource-engine' ) );
+    }
+
+    $log_list_table = new ACO_Sync_Log_List_Table();
+    $log_list_table->prepare_items();
+    ?>
+    <div class="wrap">
+        <h1 class="wp-heading-inline"><?php esc_html_e( 'Airtable to WP Sync Log', 'fpm-aco-resource-engine' ); ?></h1>
+        <p><?php esc_html_e( 'This log shows the history of operations triggered by Airtable.', 'fpm-aco-resource-engine' ); ?></p>
+        <form method="get">
+            <input type="hidden" name="page" value="aco-sync-log" />
+            <?php
+            $log_list_table->search_box( __( 'Search Logs', 'fpm-aco-resource-engine' ), 'aco-sync-log-search' );
+            $log_list_table->display();
+            ?>
+        </form>
+    </div>
+    <?php
+}
 // --- END: ACO Sync Log Admin Viewer ---
 
 // --- START: Replay Failed Jobs (Hardened Version) ---
@@ -1476,7 +1477,8 @@ function aco_re_handle_log_actions() {
         $payload = $context['payload'] ?? null;
         
         if ( $payload && function_exists( 'as_enqueue_async_action' ) ) {
-            as_enqueue_async_action( 'aco_re_process_resource_sync_action', [ 'payload' => $payload ], 'aco_resource_sync' );
+            // Enqueue the correct action hook name used by the worker.
+            as_enqueue_async_action( 'aco_re_process_resource_sync', [ 'payload' => $payload ], 'aco_resource_sync' );
             $message = sprintf( 
                 __( 'Job for Airtable Record ID %s has been re-queued.', 'fpm-aco-resource-engine' ), 
                 '<strong>' . esc_html( $log_entry['record_id'] ) . '</strong>'
@@ -1508,4 +1510,3 @@ function aco_re_show_replay_notices() {
 add_action( 'admin_notices', 'aco_re_show_replay_notices' );
 
 // --- END: Replay Failed Jobs (Hardened Version) ---
-?>
