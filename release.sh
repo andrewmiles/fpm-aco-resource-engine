@@ -30,7 +30,7 @@ echo ""
 echo "--- Release Successful, Starting Deployment ---"
 
 # Deploy the plugin using rsync
-rsync -avz --exclude='.git' --exclude='*.sh' ./ acomain@5.134.12.230:/home/acomain/public_html/wp-content/plugins/fpm-aco-resource-engine/
+/opt/homebrew/bin/rsync -avz --exclude='.git' --exclude='*.sh' ./ acomain@5.134.12.230:/home/acomain/public_html/wp-content/plugins/fpm-aco-resource-engine/
 
 # Capture the exit code from rsync
 DEPLOY_EXIT_CODE=$?
