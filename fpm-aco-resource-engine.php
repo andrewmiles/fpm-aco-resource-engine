@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.7
+ * Version:         1.17.8
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1233,37 +1233,43 @@ class ACO_Sync_Log_List_Table extends WP_List_Table {
     }
     
     protected function extra_tablenav( $which ) {
-        if ( 'top' !== $which ) {
-            return;
-        }
-        global $wpdb;
-        $table_name = $wpdb->prefix . 'aco_sync_log';
-        
-        $statuses = $wpdb->get_col( "SELECT DISTINCT status FROM {$table_name} ORDER BY status ASC" );
-        $current_status = isset( $_GET['status_filter'] ) ? sanitize_text_field( $_GET['status_filter'] ) : '';
-        
-        $sources = $wpdb->get_col( "SELECT DISTINCT source FROM {$table_name} ORDER BY source ASC" );
-        $current_source = isset( $_GET['source_filter'] ) ? sanitize_text_field( $_GET['source_filter'] ) : '';
-        
-        echo '<div class="alignleft actions">';
-        
-        echo '<select name="status_filter">';
-        echo '<option value="">' . esc_html__( 'All Statuses', 'fpm-aco-resource-engine' ) . '</option>';
-        foreach ( $statuses as $status ) {
-            printf( '<option value="%s" %s>%s</option>', esc_attr( $status ), selected( $current_status, $status, false ), esc_html( ucfirst( $status ) ) );
-        }
-        echo '</select>';
+		if ( 'top' !== $which ) {
+			return;
+		}
+		global $wpdb;
+		$table_name = $wpdb->prefix . 'aco_sync_log';
 
-        echo '<select name="source_filter">';
-        echo '<option value="">' . esc_html__( 'All Sources', 'fpm-aco-resource-engine' ) . '</option>';
-        foreach ( $sources as $source ) {
-            printf( '<option value="%s" %s>%s</option>', esc_attr( $source ), selected( $current_source, $source, false ), esc_html( ucfirst( $source ) ) );
-        }
-        echo '</select>';
+		$statuses       = $wpdb->get_col( "SELECT DISTINCT status FROM {$table_name} ORDER BY status ASC" );
+		$current_status = isset( $_GET['status_filter'] ) ? sanitize_text_field( $_GET['status_filter'] ) : '';
 
-        submit_button( __( 'Filter', 'fpm-aco-resource-engine' ), 'secondary', 'filter_action', false );
-        echo '</div>';
-    }
+		$sources        = $wpdb->get_col( "SELECT DISTINCT source FROM {$table_name} ORDER BY source ASC" );
+		$current_source = isset( $_GET['source_filter'] ) ? sanitize_text_field( $_GET['source_filter'] ) : '';
+
+		echo '<div class="alignleft actions">';
+
+		echo '<select name="status_filter">';
+		echo '<option value="">' . esc_html__( 'All Statuses', 'fpm-aco-resource-engine' ) . '</option>';
+		foreach ( $statuses as $status ) {
+			printf( '<option value="%s" %s>%s</option>', esc_attr( $status ), selected( $current_status, $status, false ), esc_html( ucfirst( $status ) ) );
+		}
+		echo '</select>';
+
+		echo '<select name="source_filter">';
+		echo '<option value="">' . esc_html__( 'All Sources', 'fpm-aco-resource-engine' ) . '</option>';
+		foreach ( $sources as $source ) {
+			printf( '<option value="%s" %s>%s</option>', esc_attr( $source ), selected( $current_source, $source, false ), esc_html( ucfirst( $source ) ) );
+		}
+		echo '</select>';
+
+		submit_button( __( 'Filter', 'fpm-aco-resource-engine' ), 'secondary', 'filter_action', false, [ 'id' => 'post-query-submit' ] );
+
+		// Add the nonce for security
+		wp_nonce_field( 'aco_export_sync_log_nonce', 'aco_export_nonce' );
+		// Add the export button
+		submit_button( __( 'Export to CSV', 'fpm-aco-resource-engine' ), 'secondary', 'export_csv', false );
+
+		echo '</div>';
+	}
 
     public function prepare_items() {
         global $wpdb;
@@ -1415,27 +1421,171 @@ function aco_re_render_log_viewer_page() {
 // --- START: Replay Failed Jobs (Hardened Version) ---
 
 /**
- * Safely parses a string that might be serialized or JSON.
- * It prioritizes JSON, forbids object unserialization, and always returns an array.
- *
- * @param mixed $raw_data The raw data from the database.
- * @return array The parsed data, or an empty array on failure.
+ * Make arbitrary values safe for CSV (mitigate Excel/LibreOffice formula injection).
+ * - Coerce to string; normalise newlines to \n (fputcsv handles quoting).
+ * - Prefix apostrophe if the value begins with =, +, -, @
  */
+function aco_re_csv_safe_cell( $value ) {
+	if ( is_null( $value ) ) {
+		$value = '';
+	} elseif ( is_bool( $value ) ) {
+		$value = $value ? '1' : '0';
+	} elseif ( is_array( $value ) || is_object( $value ) ) {
+		$value = wp_json_encode( $value );
+	} else {
+		$value = (string) $value;
+	}
+
+	$value = str_replace( [ "\r\n", "\r" ], "\n", $value );
+
+	if ( $value !== '' ) {
+		$first = substr( $value, 0, 1 );
+		if ( in_array( $first, [ '=', '+', '-', '@' ], true ) ) {
+			$value = "'" . $value; // Leading apostrophe is respected by Excel.
+		}
+	}
+	return $value;
+}
+
+/**
+ * Handles the trigger for exporting the sync log to a CSV file.
+ * This function listens for a specific GET parameter, verifies security,
+ * and then calls the logic to generate and stream the file.
+ */
+function aco_re_handle_csv_export() {
+	// Gate: only run on our log page & when requested.
+	if ( ! isset( $_GET['page'], $_GET['export_csv'] ) || 'aco-sync-log' !== $_GET['page'] ) {
+		return;
+	}
+
+	// Capability + CSRF.
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_die( esc_html__( 'Permission denied.', 'fpm-aco-resource-engine' ), esc_html__( 'Access denied', 'fpm-aco-resource-engine' ), [ 'response' => 403, 'back_link' => true ] );
+	}
+	check_admin_referer( 'aco_export_sync_log_nonce', 'aco_export_nonce' );
+
+	// Fail fast if headers already sent.
+	if ( headers_sent() ) {
+		wp_die( esc_html__( 'Cannot stream CSV: headers already sent by another output.', 'fpm-aco-resource-engine' ) );
+	}
+
+	// Performance safety nets for larger exports.
+	if ( function_exists( 'wp_raise_memory_limit' ) ) {
+		wp_raise_memory_limit( 'admin' );
+	}
+	ignore_user_abort( true );
+	@set_time_limit( 0 );
+
+	global $wpdb;
+	$table_name = $wpdb->prefix . 'aco_sync_log';
+
+	// Build WHERE (mirrors prepare_items()).
+	$where_clauses = [];
+	if ( ! empty( $_GET['status_filter'] ) ) {
+		$where_clauses[] = $wpdb->prepare( 'status = %s', sanitize_text_field( wp_unslash( $_GET['status_filter'] ) ) );
+	}
+	if ( ! empty( $_GET['source_filter'] ) ) {
+		$where_clauses[] = $wpdb->prepare( 'source = %s', sanitize_text_field( wp_unslash( $_GET['source_filter'] ) ) );
+	}
+	if ( ! empty( $_GET['s'] ) ) {
+		$search_term   = '%' . $wpdb->esc_like( sanitize_text_field( wp_unslash( $_GET['s'] ) ) ) . '%';
+		$where_clauses[] = $wpdb->prepare( '(record_id LIKE %s OR message LIKE %s)', $search_term, $search_term );
+	}
+	$where_sql = $where_clauses ? 'WHERE ' . implode( ' AND ', $where_clauses ) : '';
+
+	// ORDER BY (whitelist).
+	$allowed_orderby = [ 'ts', 'source', 'status', 'action' ];
+	$orderby_param   = isset( $_GET['orderby'] ) ? sanitize_key( $_GET['orderby'] ) : 'ts';
+	$orderby         = in_array( $orderby_param, $allowed_orderby, true ) ? $orderby_param : 'ts';
+	$order_param     = isset( $_GET['order'] ) ? strtolower( (string) $_GET['order'] ) : 'desc';
+	$order           = in_array( $order_param, [ 'asc', 'desc' ], true ) ? $order_param : 'desc';
+
+	// Headers.
+	nocache_headers();
+	header( 'Content-Type: text/csv; charset=utf-8' );
+	header( 'X-Content-Type-Options: nosniff' );
+	$filename = 'aco-sync-log-' . gmdate( 'Y-m-d-His' ) . '.csv';
+	header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+
+	// Open output stream.
+	$out = fopen( 'php://output', 'w' );
+
+	// Column set: include all key columns (spec parity).
+	$column_keys = [
+		'id', 'ts', 'source', 'record_id', 'last_modified', 'action',
+		'resource_id', 'attachment_id', 'fingerprint', 'status',
+		'attempts', 'duration_ms', 'error_code', 'message'
+	];
+	fputcsv( $out, $column_keys );
+
+	// Chunked stream to keep memory bounded.
+	$limit  = 1000;
+	$offset = 0;
+
+	do {
+		$sql  = $wpdb->prepare(
+			"SELECT * FROM {$table_name} {$where_sql} ORDER BY {$orderby} {$order} LIMIT %d OFFSET %d",
+			$limit,
+			$offset
+		);
+		$rows = $wpdb->get_results( $sql, ARRAY_A );
+
+		if ( empty( $rows ) ) {
+			break;
+		}
+
+		foreach ( $rows as $row ) {
+			// Extract a human-readable message, safely.
+			$parsed        = aco_re_safe_parse_message( $row['message'] ?? '' );
+			$row['message'] = ( isset( $parsed['message'] ) && is_string( $parsed['message'] ) ) ? $parsed['message'] : '';
+
+			// Build row in the defined column order with CSV-safe cells.
+			$csv = [];
+			foreach ( $column_keys as $key ) {
+				$csv[] = aco_re_csv_safe_cell( $row[ $key ] ?? '' );
+			}
+			fputcsv( $out, $csv );
+		}
+
+		// Advance window.
+		$offset += $limit;
+		// Flush to the client to avoid buffering.
+		if ( function_exists( 'flush' ) ) {
+			flush();
+		}
+		if ( function_exists( 'ob_flush' ) ) {
+			@ob_flush();
+		}
+	} while ( count( $rows ) === $limit );
+
+	fclose( $out );
+	exit;
+}
+
 function aco_re_safe_parse_message( $raw_data ): array {
-    if ( is_array( $raw_data ) ) {
-        return $raw_data;
-    }
-    if ( ! is_string( $raw_data ) || empty( $raw_data ) ) {
-        return [];
-    }
-    // PHP's is_serialized() is unreliable. We check for the typical structure.
-    if ( strpos( $raw_data, 'a:' ) === 0 && strpos( $raw_data, '{' ) > 0 ) {
-        // Only unserialize if it looks like a serialized array.
-        // Forbidding classes is the critical security measure.
-        $data = @unserialize( $raw_data, [ 'allowed_classes' => false ] );
-        return is_array( $data ) ? $data : [];
-    }
-    return [];
+	if ( is_array( $raw_data ) ) {
+		return $raw_data;
+	}
+	if ( ! is_string( $raw_data ) || $raw_data === '' ) {
+		return [];
+	}
+
+	// Try JSON first (docstring intent).
+	$trim = ltrim( $raw_data );
+	if ( $trim !== '' && ( $trim[0] === '{' || $trim[0] === '[' ) ) {
+		$json = json_decode( $raw_data, true );
+		if ( is_array( $json ) ) {
+			return $json;
+		}
+	}
+
+	// Fallback: PHP serialised array, forbid objects.
+	if ( strpos( $raw_data, 'a:' ) === 0 && strpos( $raw_data, '{' ) !== false ) {
+		$data = @unserialize( $raw_data, [ 'allowed_classes' => false ] );
+		return is_array( $data ) ? $data : [];
+	}
+
+	return [];
 }
 
 /**
@@ -1493,6 +1643,7 @@ function aco_re_handle_log_actions() {
     exit;
 }
 add_action( 'admin_init', 'aco_re_handle_log_actions' );
+add_action( 'admin_init', 'aco_re_handle_csv_export' );
 
 /**
  * Displays the admin notice after a replay action.
