@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.8
+ * Version:         1.17.9
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1272,6 +1272,7 @@ class ACO_Sync_Log_List_Table extends WP_List_Table {
 	}
 
     public function prepare_items() {
+        wp_die('DEBUG: prepare_items() is running from the correct file.');
         global $wpdb;
         $table_name = $wpdb->prefix . 'aco_sync_log';
 
