@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.14
+ * Version:         1.17.15
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1191,90 +1191,63 @@ function _aco_re_sideload_and_attach_file( int $post_id, string $file_url ) {
 }
 
 /**
- * Private helper to find term IDs from names and set them on a post for a given taxonomy.
- * - Clears existing terms when $names is empty.
- * - Optionally enforces the Airtable allow-list for `universal_tag`.
- *
- * @param int    $post_id   The ID of the post to update.
- * @param string $taxonomy  The taxonomy slug.
- * @param array  $names     Array of raw term names (strings).
- * @param array  $log_ctx   Context for aco_re_log (e.g., ['record_id'=>..., 'post_id'=>..., 'action'=>...]).
- * @param bool   $enforce_allowlist Whether to reject non-approved tags via aco_re_get_tag_violations().
+ * Deterministic term setter:
+ * - Resolves each term by name with get_term_by() to avoid get_terms() filters.
+ * - Enforces allow-list (when requested).
+ * - Replaces terms atomically by clearing first, then setting exactly the resolved IDs.
  */
 function _aco_re_set_post_terms_from_names( int $post_id, string $taxonomy, array $names, array $log_ctx, bool $enforce_allowlist = false ): void {
-    // Defensive: taxonomy must exist.
+    // Defensive
     if ( ! taxonomy_exists( $taxonomy ) ) {
-        $ctx = $log_ctx;
-        $ctx['taxonomy'] = $taxonomy;
+        $ctx = $log_ctx; $ctx['taxonomy'] = $taxonomy;
         aco_re_log( 'error', sprintf( 'Taxonomy "%s" does not exist; cannot set terms.', $taxonomy ), $ctx );
         return;
     }
 
-    // Normalise inputs: strings only, trimmed, unique, non-empty.
+    // Normalise
     $names = array_values( array_unique( array_filter( array_map(
         static function( $n ) { return trim( (string) $n ); },
         (array) $names
     ) ) ) );
 
-    // Clear all terms if no names supplied.
+    // Allow-list enforcement for universal_tag
+    if ( $enforce_allowlist && ! empty( $names ) ) {
+        $violations = aco_re_get_tag_violations( $names ); // uses names
+        if ( ! empty( $violations ) ) {
+            $ctx = $log_ctx; $ctx['taxonomy'] = $taxonomy; $ctx['violations'] = $violations;
+            aco_re_log( 'warning', sprintf( 'Rejected non-approved term(s) for "%s": %s', $taxonomy, implode( ', ', $violations ) ), $ctx );
+            $names = array_values( array_diff( $names, $violations ) );
+        }
+    }
+
+    // If empty after validation → clear all and finish
     if ( empty( $names ) ) {
         wp_set_object_terms( $post_id, [], $taxonomy );
         return;
     }
 
-    // Optional allow-list enforcement - used for `universal_tag`.
-    if ( $enforce_allowlist ) {
-        $violations = aco_re_get_tag_violations( $names ); // expects names
-        if ( ! empty( $violations ) ) {
-            $ctx = $log_ctx;
-            $ctx['taxonomy']   = $taxonomy;
-            $ctx['violations'] = $violations;
-            aco_re_log(
-                'warning',
-                sprintf( 'Rejected non-approved term(s) for "%s": %s', $taxonomy, implode( ', ', $violations ) ),
-                $ctx
-            );
-            // Drop the violating names.
-            $names = array_values( array_diff( $names, $violations ) );
-        }
-        if ( empty( $names ) ) {
-            wp_set_object_terms( $post_id, [], $taxonomy );
-            return;
+    // Resolve by name (not via get_terms) to avoid filter-driven widening
+    $term_ids  = [];
+    $not_found = [];
+    foreach ( $names as $name ) {
+        $term = get_term_by( 'name', $name, $taxonomy );
+        if ( $term && ! is_wp_error( $term ) ) {
+            $term_ids[] = (int) $term->term_id;
+        } else {
+            $not_found[] = $name;
         }
     }
 
-    // Bulk resolve terms in a single query.
-    $terms = get_terms( [
-        'taxonomy'   => $taxonomy,
-        'hide_empty' => false,
-        'name__in'   => $names,
-    ] );
-
-    $term_ids    = [];
-    $found_names = [];
-
-    if ( ! is_wp_error( $terms ) ) {
-        foreach ( $terms as $t ) {
-            $term_ids[]    = (int) $t->term_id;
-            $found_names[] = (string) $t->name;
-        }
+    if ( $not_found ) {
+        $ctx = $log_ctx; $ctx['taxonomy'] = $taxonomy; $ctx['not_found'] = $not_found;
+        aco_re_log( 'warning', sprintf( 'The following term name(s) were not found for "%s": %s', $taxonomy, implode( ', ', $not_found ) ), $ctx );
     }
 
-    // Anything not found is logged (no auto-create).
-    $not_found = array_values( array_diff( $names, $found_names ) );
-    if ( ! empty( $not_found ) ) {
-        $ctx = $log_ctx;
-        $ctx['taxonomy']  = $taxonomy;
-        $ctx['not_found'] = $not_found;
-        aco_re_log(
-            'warning',
-            sprintf( 'The following term name(s) were not found for "%s": %s', $taxonomy, implode( ', ', $not_found ) ),
-            $ctx
-        );
+    // Hard replace: clear first, then set exactly the resolved IDs (if any)
+    wp_set_object_terms( $post_id, [], $taxonomy );
+    if ( $term_ids ) {
+        wp_set_object_terms( $post_id, $term_ids, $taxonomy, false );
     }
-
-    // Replace existing terms with the resolved IDs (clears if none resolved).
-    wp_set_object_terms( $post_id, $term_ids, $taxonomy );
 }
 
 /**
