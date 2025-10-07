@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.11
+ * Version:         1.17.12
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -957,34 +957,259 @@ function aco_re_log( string $level, string $message, array $context = [] ): void
 }
 
 /**
+ * Validate a file source and perform a HEAD pre-flight.
+ * Enforces https scheme, allowed host(s), allowed MIME(s), and a max size.
+ */
+function aco_re_preflight_remote_file( string $file_url ) {
+    $url = esc_url_raw( $file_url );
+    $parts = wp_parse_url( $url );
+    if ( empty( $parts['scheme'] ) || strtolower( $parts['scheme'] ) !== 'https' ) {
+        return new WP_Error( 'bad_scheme', 'Only HTTPS sources are allowed.' );
+    }
+    $host = strtolower( $parts['host'] ?? '' );
+    // Allow-list: default empty means allow any host; override via filter.
+    $allowed_hosts = (array) apply_filters( 'aco_re_allowed_file_hosts', [] );
+    if ( $allowed_hosts && ! in_array( $host, array_map( 'strtolower', $allowed_hosts ), true ) ) {
+        return new WP_Error( 'host_not_allowed', 'Source host is not allow-listed.' );
+    }
+
+    $head = wp_remote_head( $url, [ 'timeout' => 10, 'redirection' => 2 ] );
+    if ( is_wp_error( $head ) ) {
+        return $head;
+    }
+    $code = (int) wp_remote_retrieve_response_code( $head );
+    if ( $code < 200 || $code >= 300 ) {
+        return new WP_Error( 'head_failed', 'HEAD request failed with HTTP ' . $code );
+    }
+
+    $ctype = strtolower( (string) wp_remote_retrieve_header( $head, 'content-type' ) );
+    $allowed_mimes = (array) apply_filters( 'aco_re_allowed_mime_types', [ 'application/pdf' ] );
+    $ok_mime = false;
+    foreach ( $allowed_mimes as $mime ) {
+        if ( $ctype && strpos( $ctype, strtolower( $mime ) ) !== false ) { $ok_mime = true; break; }
+    }
+    if ( ! $ok_mime ) {
+        return new WP_Error( 'bad_mime', 'Remote file type is not permitted.' );
+    }
+
+    $len = (int) wp_remote_retrieve_header( $head, 'content-length' );
+    $max_bytes = (int) apply_filters( 'aco_re_max_sideload_bytes', 50 * 1024 * 1024 ); // 50 MB default
+    if ( $len > 0 && $len > $max_bytes ) {
+        return new WP_Error( 'too_large', 'Remote file exceeds the permitted size.' );
+    }
+
+    return [
+        'content_type'   => $ctype,
+        'content_length' => $len,
+        'url'            => $url,
+        'host'           => $host,
+        'parts'          => $parts,
+    ];
+}
+
+/**
+ * Try to resolve an existing attachment for our own media URLs (primary or mirror),
+ * avoiding re-uploading duplicates.
+ */
+function aco_re_try_resolve_existing_attachment_from_url( string $file_url ) {
+    $parts = wp_parse_url( $file_url );
+    if ( empty( $parts['host'] ) || empty( $parts['path'] ) ) {
+        return 0;
+    }
+
+    $primary_host = apply_filters( 'aco_re_primary_media_host', 'media.acomain.site' );
+    $mirror_host  = apply_filters( 'aco_re_failover_media_host', 'aco-media-production-mirror.s3.eu-west-1.wasabisys.com' );
+    $host = strtolower( $parts['host'] );
+
+    if ( strtolower( $primary_host ) !== $host && strtolower( $mirror_host ) !== $host ) {
+        return 0; // Not our infra → cannot resolve by key.
+    }
+
+    $key = ltrim( (string) $parts['path'], '/' );
+
+    global $wpdb;
+    $table = $wpdb->prefix . 'as3cf_items';
+    if ( ! function_exists( 'aco_re_table_exists_strict' ) || ! aco_re_table_exists_strict( $table ) ) {
+        return 0;
+    }
+
+    // Look up the attachment by the exact offload key (path).
+    $attachment_id = (int) $wpdb->get_var(
+        $wpdb->prepare( "SELECT source_id FROM {$table} WHERE path = %s LIMIT 1", $key )
+    );
+
+    return $attachment_id > 0 ? $attachment_id : 0;
+}
+
+/**
+ * Wait briefly for Offload Media to record bucket/path for a new attachment.
+ */
+function aco_re_get_offload_info_with_retry( int $attachment_id, int $attempts = 5, int $sleep_ms = 500 ) {
+    global $wpdb;
+    $table = $wpdb->prefix . 'as3cf_items';
+    if ( ! function_exists( 'aco_re_table_exists_strict' ) || ! aco_re_table_exists_strict( $table ) ) {
+        return null;
+    }
+    for ( $i = 0; $i < max( 1, $attempts ); $i++ ) {
+        $row = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT bucket, path FROM {$table} WHERE source_id = %d AND source_type IN ('media','media-library') LIMIT 1",
+                $attachment_id
+            ),
+            ARRAY_A
+        );
+        if ( $row && ! empty( $row['bucket'] ) && ! empty( $row['path'] ) ) {
+            return $row;
+        }
+        // Sleep between attempts.
+        if ( $i < $attempts - 1 ) {
+            usleep( max( 0, $sleep_ms ) * 1000 );
+        }
+    }
+    return null;
+}
+
+/**
+ * Handle a cleared FileURL (remove association).
+ */
+function aco_re_clear_primary_attachment( int $post_id ) {
+    delete_post_meta( $post_id, '_aco_primary_attachment_id' );
+    delete_post_meta( $post_id, '_aco_file_fingerprint' );
+}
+
+
+/**
+ * Enhanced helper: validates, de-dupes, sideloads (only when needed), and fingerprints.
+ */
+function _aco_re_sideload_and_attach_file( int $post_id, string $file_url ) {
+    // 1) Pre-flight validation (scheme/host/MIME/size)
+    $pre = aco_re_preflight_remote_file( $file_url );
+    if ( is_wp_error( $pre ) ) {
+        return $pre;
+    }
+    $pre = is_array( $pre ) ? $pre : [];
+
+    // 2) Shortcut: if this URL is already under our media domain(s), reuse existing attachment.
+    $existing_id = aco_re_try_resolve_existing_attachment_from_url( $file_url );
+    if ( $existing_id > 0 ) {
+        update_post_meta( $post_id, '_aco_primary_attachment_id', $existing_id );
+
+        // Compute fingerprint from Offload table.
+        $off = aco_re_get_offload_info_with_retry( $existing_id );
+        if ( $off ) {
+            $filesize = 0;
+            $meta = wp_get_attachment_metadata( $existing_id );
+            if ( is_array( $meta ) && ! empty( $meta['filesize'] ) ) {
+                $filesize = (int) $meta['filesize'];
+            }
+            if ( ! $filesize ) {
+                $filepath = get_attached_file( $existing_id );
+                if ( $filepath && file_exists( $filepath ) ) {
+                    $filesize = (int) filesize( $filepath );
+                } elseif ( ! empty( $pre['content_length'] ) ) {
+                    $filesize = (int) $pre['content_length'];
+                }
+            }
+            if ( $filesize ) {
+                $fingerprint = sprintf( 's3:%s:%s|%d', $off['bucket'], ltrim( (string) $off['path'], '/' ), $filesize );
+                update_post_meta( $post_id, '_aco_file_fingerprint', $fingerprint );
+            }
+        }
+
+        aco_re_log( 'info', 'Reused existing attachment for media-domain URL.', [
+            'post_id'       => $post_id,
+            'attachment_id' => $existing_id,
+            'action'        => 'file_reuse',
+            'fingerprint'   => get_post_meta( $post_id, '_aco_file_fingerprint', true ),
+            'payload'       => [ 'FileURL' => $file_url ],
+        ] );
+        return true;
+    }
+
+    // 3) Sideload (external source)
+    if ( ! function_exists( 'media_handle_sideload' ) ) {
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+    }
+
+    $tmp = download_url( $file_url, 30 ); // honour WP HTTP settings; 30s safeguard
+    if ( is_wp_error( $tmp ) ) {
+        return $tmp;
+    }
+
+    $file_array = [
+        'name'     => basename( wp_parse_url( $file_url, PHP_URL_PATH ) ) ?: 'document.pdf',
+        'tmp_name' => $tmp,
+    ];
+
+    $attachment_id = media_handle_sideload( $file_array, $post_id );
+    if ( is_wp_error( $attachment_id ) ) {
+        @unlink( $file_array['tmp_name'] );
+        return $attachment_id;
+    }
+
+    update_post_meta( $post_id, '_aco_primary_attachment_id', $attachment_id );
+
+    // 4) Compute fingerprint (with small retry for Offload row)
+    $off = aco_re_get_offload_info_with_retry( $attachment_id );
+    if ( ! $off ) {
+        return new WP_Error( 'fingerprint_failed', 'Could not retrieve offload info to generate fingerprint.' );
+    }
+
+    $filesize = 0;
+    $filepath = get_attached_file( $attachment_id );
+    if ( $filepath && file_exists( $filepath ) ) {
+        $filesize = (int) filesize( $filepath );
+    }
+    if ( ! $filesize ) {
+        $meta = wp_get_attachment_metadata( $attachment_id );
+        if ( is_array( $meta ) && ! empty( $meta['filesize'] ) ) {
+            $filesize = (int) $meta['filesize'];
+        }
+    }
+    if ( ! $filesize && ! empty( $pre['content_length'] ) ) {
+        $filesize = (int) $pre['content_length'];
+    }
+
+    if ( ! $filesize ) {
+        return new WP_Error( 'fingerprint_failed', 'Could not determine attachment size for fingerprint.' );
+    }
+
+    $fingerprint = sprintf( 's3:%s:%s|%d', $off['bucket'], ltrim( (string) $off['path'], '/' ), $filesize );
+    update_post_meta( $post_id, '_aco_file_fingerprint', $fingerprint );
+
+    aco_re_log( 'info', 'Sideloaded and fingerprinted file.', [
+        'post_id'       => $post_id,
+        'attachment_id' => $attachment_id,
+        'fingerprint'   => $fingerprint,
+        'action'        => 'file_sideload',
+        'payload'       => [ 'FileURL' => $file_url ],
+    ] );
+
+    return true;
+}
+
+/**
  * Processes a single resource sync job from the Action Scheduler queue.
  *
  * @param array|string $payload The data received from the Airtable webhook (array or JSON string).
  * @return array Outcome summary for observability: ['status' => 'created|updated|skipped|error', 'post_id' => int|null, 'reason' => string|null]
  */
 function aco_re_process_resource_sync_action( $payload ) {
-    // 0. Decode JSON if a string payload is provided.
     if ( is_string( $payload ) ) {
         $decoded = json_decode( $payload, true );
         if ( json_last_error() === JSON_ERROR_NONE && is_array( $decoded ) ) {
             $payload = $decoded;
         }
     }
-
-    // 1. Normalize the incoming data.
-    $data = ( is_array( $payload ) && isset( $payload['payload'] ) && is_array( $payload['payload'] ) )
-        ? $payload['payload']
-        : ( is_array( $payload ) ? $payload : [] );
-
-    // 1a. Validate post type availability early.
+    $data = ( is_array( $payload ) && isset( $payload['payload'] ) && is_array( $payload['payload'] ) ) ? $payload['payload'] : ( is_array( $payload ) ? $payload : [] );
     if ( ! post_type_exists( 'resource' ) ) {
         aco_re_log( 'error', 'Post type "resource" is not registered.' );
         return [ 'status' => 'error', 'post_id' => null, 'reason' => 'post_type_missing' ];
     }
-
-    // 2. Validate required fields.
-    $raw_record_id      = $data['record_id']    ?? '';
-    $raw_last_modified  = $data['LastModified'] ?? '';
+    $raw_record_id = $data['record_id'] ?? '';
+    $raw_last_modified = $data['LastModified'] ?? '';
     $record_id = sanitize_text_field( (string) $raw_record_id );
     list( $incoming_ms, $incoming_iso ) = aco_re_parse_last_modified( $raw_last_modified );
 
@@ -992,108 +1217,74 @@ function aco_re_process_resource_sync_action( $payload ) {
         aco_re_log( 'error', 'Payload missing valid record_id or LastModified.', [ 'has_record_id' => $record_id !== '', 'raw_last_modified' => is_string( $raw_last_modified ) ? $raw_last_modified : null, 'action' => 'validation' ] );
         return [ 'status' => 'error', 'post_id' => null, 'reason' => 'invalid_payload' ];
     }
-
-    // 3. Concurrency lock per record.
     if ( ! aco_re_acquire_lock( $record_id, 120 ) ) {
         aco_re_log( 'warning', 'Lock present, skipping concurrent job.', [ 'record_id' => $record_id, 'action' => 'lock' ] );
         return [ 'status' => 'skipped', 'post_id' => null, 'reason' => 'locked' ];
     }
-
     try {
-        // 4. Lookup post by Airtable record_id.
         $post_id = aco_re_get_post_id_by_record_id( $record_id );
-        $action = 'update'; // Default action for logging
-
+        $action = 'update';
         if ( $post_id ) {
-            // UPDATE path
             $stored_ms = (int) get_post_meta( $post_id, ACO_AT_LAST_MODIFIED_MS_META, true );
             if ( ! $stored_ms ) {
                 $stored_iso_legacy = (string) get_post_meta( $post_id, ACO_AT_LAST_MODIFIED_META, true );
-                if ( $stored_iso_legacy ) {
-                    list( $stored_ms_from_iso ) = aco_re_parse_last_modified( $stored_iso_legacy );
-                    $stored_ms = (int) $stored_ms_from_iso;
-                }
+                if ( $stored_iso_legacy ) { list( $stored_ms_from_iso ) = aco_re_parse_last_modified( $stored_iso_legacy ); $stored_ms = (int) $stored_ms_from_iso; }
             }
-
             if ( $incoming_ms <= $stored_ms ) {
                 aco_re_log( 'info', 'SKIP stale update.', [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => 'skip' ] );
                 return [ 'status' => 'skipped', 'post_id' => $post_id, 'reason' => 'stale' ];
             }
-
             $update = [ 'ID' => $post_id ];
-            if ( isset($data['Title']) ) { $update['post_title'] = wp_strip_all_tags( $data['Title'] ); }
-
-            if ( count( $update ) > 1 ) {
-                wp_update_post( wp_slash( $update ), true, false );
-            }
-            
+            if ( isset( $data['Title'] ) ) { $update['post_title'] = wp_strip_all_tags( $data['Title'] ); }
+            if ( count( $update ) > 1 ) { wp_update_post( wp_slash( $update ), true, false ); }
             update_post_meta( $post_id, '_aco_summary', isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '' );
             update_post_meta( $post_id, '_aco_document_date', ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '' );
-
             update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_META, $incoming_iso );
             update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_MS_META, $incoming_ms );
-
         } else {
-            // CREATE path
             $action = 'create';
-            $title   = $data['Title'] ?? 'Resource ' . $record_id;
+            $title = $data['Title'] ?? 'Resource ' . $record_id;
             $content = $data['Content'] ?? '';
-            
             $meta_input = [
-                ACO_AT_RECORD_ID_META        => $record_id,
-                ACO_AT_LAST_MODIFIED_META    => $incoming_iso,
+                ACO_AT_RECORD_ID_META => $record_id,
+                ACO_AT_LAST_MODIFIED_META => $incoming_iso,
                 ACO_AT_LAST_MODIFIED_MS_META => $incoming_ms,
-                '_aco_summary'               => isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '',
-                '_aco_document_date'         => ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '',
+                '_aco_summary' => isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '',
+                '_aco_document_date' => ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '',
             ];
-
-            $insert = [
-                'post_type'    => 'resource',
-                'post_status'  => 'publish',
-                'post_title'   => wp_strip_all_tags( $title ),
-                'post_content' => wp_kses_post( $content ),
-                'meta_input'   => $meta_input,
-            ];
-
+            $insert = [ 'post_type' => 'resource', 'post_status' => 'publish', 'post_title' => wp_strip_all_tags( $title ), 'post_content' => wp_kses_post( $content ), 'meta_input' => $meta_input, ];
             $post_id = wp_insert_post( wp_slash( $insert ), true );
             if ( is_wp_error( $post_id ) ) {
                 aco_re_log( 'error', 'Create failed.', [ 'record_id' => $record_id, 'error' => $post_id->get_error_message(), 'action' => 'create' ] );
                 return [ 'status' => 'error', 'post_id' => null, 'reason' => 'create_failed' ];
             }
         }
-        
-        // --- START: HANDLE TAXONOMIES ---
         if ( ! is_wp_error( $post_id ) && $post_id > 0 ) {
-            // Handle Type Taxonomy
             if ( ! empty( $data['Type'] ) ) {
                 $type_term = get_term_by( 'name', $data['Type'], 'resource_type' );
-                if ( $type_term ) {
-                    wp_set_object_terms( $post_id, $type_term->term_id, 'resource_type' );
-                } else {
-                    aco_re_log( 'warning', "Resource Type '{$data['Type']}' not found.", [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => $action ] );
-                }
-            } else {
-                wp_set_object_terms( $post_id, [], 'resource_type' ); // Clear if empty
-            }
-
-            // Handle Tags Taxonomy
+                if ( $type_term ) { wp_set_object_terms( $post_id, $type_term->term_id, 'resource_type' ); } 
+                else { aco_re_log( 'warning', "Resource Type '{$data['Type']}' not found.", [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => $action ] ); }
+            } else { wp_set_object_terms( $post_id, [], 'resource_type' ); }
             if ( ! empty( $data['Tags'] ) && is_array( $data['Tags'] ) ) {
                 $tag_ids = [];
                 foreach ( $data['Tags'] as $tag_name ) {
                     $tag_term = get_term_by( 'name', $tag_name, 'universal_tag' );
-                    if ( $tag_term ) {
-                        $tag_ids[] = $tag_term->term_id;
-                    } else {
-                        aco_re_log( 'warning', "Universal Tag '{$tag_name}' not found.", [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => $action ] );
-                    }
+                    if ( $tag_term ) { $tag_ids[] = $tag_term->term_id; } 
+                    else { aco_re_log( 'warning', "Universal Tag '{$tag_name}' not found.", [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => $action ] ); }
                 }
                 wp_set_object_terms( $post_id, $tag_ids, 'universal_tag' );
-            } else {
-                wp_set_object_terms( $post_id, [], 'universal_tag' ); // Clear if empty
+            } else { wp_set_object_terms( $post_id, [], 'universal_tag' ); }
+            if ( array_key_exists( 'FileURL', $data ) && is_string( $data['FileURL'] ) && $data['FileURL'] !== '' ) {
+                $file_result = _aco_re_sideload_and_attach_file( (int) $post_id, $data['FileURL'] );
+                if ( is_wp_error( $file_result ) ) {
+                    aco_re_log( 'warning', 'File handling failed.', [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'error' => $file_result->get_error_message(), 'action' => $action, 'payload' => [ 'FileURL' => $data['FileURL'] ], ] );
+                }
+            }
+            if ( array_key_exists( 'FileURL', $data ) && ( ! is_string( $data['FileURL'] ) || $data['FileURL'] === '' ) ) {
+                aco_re_clear_primary_attachment( (int) $post_id );
+                aco_re_log( 'info', 'Cleared primary attachment due to empty FileURL.', [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'action' => 'file_clear', ] );
             }
         }
-        // --- END: HANDLE TAXONOMIES ---
-
         if ( $action === 'create' ) {
             aco_re_log( 'info', 'ACCEPTED CREATE.', [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'action' => 'create' ] );
             return [ 'status' => 'created', 'post_id' => (int) $post_id, 'reason' => null ];
@@ -1101,9 +1292,8 @@ function aco_re_process_resource_sync_action( $payload ) {
             aco_re_log( 'info', 'ACCEPTED UPDATE.', [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => 'update' ] );
             return [ 'status' => 'updated', 'post_id' => $post_id, 'reason' => null ];
         }
-
     } catch ( Throwable $e ) {
-        aco_re_log( 'error', 'Unhandled exception.', [ 'record_id' => $record_id, 'exception' => $e->getMessage(), 'action' => 'exception' ] );
+        aco_re_log( 'error', 'Unhandled exception.', [ 'record_id' => $record_id, 'exception' => $e->get_message(), 'action' => 'exception' ] );
         return [ 'status' => 'error', 'post_id' => null, 'reason' => 'exception' ];
     } finally {
         aco_re_release_lock( $record_id );
