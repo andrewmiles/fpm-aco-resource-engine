@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.13
+ * Version:         1.17.14
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1295,9 +1295,9 @@ function aco_re_process_resource_sync_action( $payload ) {
         aco_re_log( 'error', 'Post type "resource" is not registered.' );
         return [ 'status' => 'error', 'post_id' => null, 'reason' => 'post_type_missing' ];
     }
-    $raw_record_id     = $data['record_id'] ?? '';
+    $raw_record_id = $data['record_id'] ?? '';
     $raw_last_modified = $data['LastModified'] ?? '';
-    $record_id         = sanitize_text_field( (string) $raw_record_id );
+    $record_id = sanitize_text_field( (string) $raw_record_id );
     list( $incoming_ms, $incoming_iso ) = aco_re_parse_last_modified( $raw_last_modified );
 
     if ( $record_id === '' || $incoming_ms === 0 ) {
@@ -1310,93 +1310,80 @@ function aco_re_process_resource_sync_action( $payload ) {
     }
     try {
         $post_id = aco_re_get_post_id_by_record_id( $record_id );
-        $action  = 'update';
-        if ( $post_id ) {
+        $action = 'update';
+
+        if ( $post_id ) { // --- UPDATE PATH ---
             $stored_ms = (int) get_post_meta( $post_id, ACO_AT_LAST_MODIFIED_MS_META, true );
             if ( ! $stored_ms ) {
                 $stored_iso_legacy = (string) get_post_meta( $post_id, ACO_AT_LAST_MODIFIED_META, true );
-                if ( $stored_iso_legacy ) {
-                    list( $stored_ms_from_iso ) = aco_re_parse_last_modified( $stored_iso_legacy );
-                    $stored_ms = (int) $stored_ms_from_iso;
-                }
+                if ( $stored_iso_legacy ) { list( $stored_ms_from_iso ) = aco_re_parse_last_modified( $stored_iso_legacy ); $stored_ms = (int) $stored_ms_from_iso; }
             }
             if ( $incoming_ms <= $stored_ms ) {
                 aco_re_log( 'info', 'SKIP stale update.', [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => 'skip' ] );
                 return [ 'status' => 'skipped', 'post_id' => $post_id, 'reason' => 'stale' ];
             }
             $update = [ 'ID' => $post_id ];
-            if ( isset( $data['Title'] ) ) {
-                $update['post_title'] = wp_strip_all_tags( $data['Title'] );
-            }
-            if ( count( $update ) > 1 ) {
-                wp_update_post( wp_slash( $update ), true, false );
-            }
-            update_post_meta( $post_id, '_aco_summary', isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '' );
-            update_post_meta( $post_id, '_aco_document_date', ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '' );
-            update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_META, $incoming_iso );
-            update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_MS_META, $incoming_ms );
-        } else {
-            $action  = 'create';
-            $title   = $data['Title'] ?? 'Resource ' . $record_id;
+            if ( isset( $data['Title'] ) ) { $update['post_title'] = wp_strip_all_tags( $data['Title'] ); }
+            if ( count( $update ) > 1 ) { wp_update_post( wp_slash( $update ), true, false ); }
+            
+        } else { // --- CREATE PATH ---
+            $action = 'create';
+            $title = $data['Title'] ?? 'Resource ' . $record_id;
             $content = $data['Content'] ?? '';
-            $meta_input = [
-                ACO_AT_RECORD_ID_META      => $record_id,
-                ACO_AT_LAST_MODIFIED_META  => $incoming_iso,
-                ACO_AT_LAST_MODIFIED_MS_META => $incoming_ms,
-                '_aco_summary'             => isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '',
-                '_aco_document_date'       => ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '',
-            ];
-            $insert = [
-                'post_type'    => 'resource',
-                'post_status'  => 'publish',
-                'post_title'   => wp_strip_all_tags( $title ),
-                'post_content' => wp_kses_post( $content ),
-                'meta_input'   => $meta_input,
-            ];
+            $insert = [ 'post_type' => 'resource', 'post_status' => 'publish', 'post_title' => wp_strip_all_tags( $title ), 'post_content' => wp_kses_post( $content ) ];
             $post_id = wp_insert_post( wp_slash( $insert ), true );
             if ( is_wp_error( $post_id ) ) {
                 aco_re_log( 'error', 'Create failed.', [ 'record_id' => $record_id, 'error' => $post_id->get_error_message(), 'action' => 'create' ] );
                 return [ 'status' => 'error', 'post_id' => null, 'reason' => 'create_failed' ];
             }
         }
-        if ( ! is_wp_error( $post_id ) && $post_id > 0 ) {
-            // Build a shared log context once:
-            $log_ctx = [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'action' => $action ];
 
-            // Resource Type - single name list, no allow-list enforcement required.
-            $type_names = ( ! empty( $data['Type'] ) && is_string( $data['Type'] ) ) ? [ $data['Type'] ] : [];
-            _aco_re_set_post_terms_from_names( (int) $post_id, 'resource_type', $type_names, $log_ctx, false );
+        if ( is_wp_error( $post_id ) || ! ( $post_id > 0 ) ) {
+             // This case should be caught by the create path error, but as a safeguard:
+            aco_re_log( 'error', 'Invalid post ID after create/update.', [ 'record_id' => $record_id, 'action' => $action ] );
+            return [ 'status' => 'error', 'post_id' => null, 'reason' => 'invalid_post_id' ];
+        }
 
-            // Universal Tags - may include many terms; enforce Airtable allow-list here per spec.
-            $tag_names = ( ! empty( $data['Tags'] ) && is_array( $data['Tags'] ) ) ? $data['Tags'] : [];
-            _aco_re_set_post_terms_from_names( (int) $post_id, 'universal_tag', $tag_names, $log_ctx, true );
+        // --- COMMON LOGIC FOR BOTH CREATE AND UPDATE ---
+        // Meta fields
+        update_post_meta( $post_id, ACO_AT_RECORD_ID_META, $record_id ); // Ensure this is always set
+        update_post_meta( $post_id, '_aco_summary', isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '' );
+        update_post_meta( $post_id, '_aco_document_date', ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '' );
+        update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_META, $incoming_iso );
+        update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_MS_META, $incoming_ms );
 
-            // Handle FileURL (sideload, reuse, or clear).
-            if ( array_key_exists( 'FileURL', $data ) ) {
-                $file_url = is_string( $data['FileURL'] ) ? trim( $data['FileURL'] ) : '';
-                if ( $file_url !== '' ) {
-                    $file_result = _aco_re_sideload_and_attach_file( (int) $post_id, $file_url );
-                    if ( is_wp_error( $file_result ) ) {
-                        $log_ctx['error']   = $file_result->get_error_message();
-                        $log_ctx['payload'] = [ 'FileURL' => $file_url ];
-                        aco_re_log( 'warning', 'File handling failed.', $log_ctx );
-                    }
-                } else {
-                    aco_re_clear_primary_attachment( (int) $post_id );
-                    aco_re_log( 'info', 'Cleared primary attachment due to empty FileURL.', [
-                        'record_id' => $record_id,
-                        'post_id'   => (int) $post_id,
-                        'action'    => 'file_clear',
-                    ] );
+        // Taxonomy fields
+        $log_ctx = [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'action' => $action ];
+        $type_names = ( ! empty( $data['Type'] ) && is_string( $data['Type'] ) ) ? [ $data['Type'] ] : [];
+        _aco_re_set_post_terms_from_names( (int) $post_id, 'resource_type', $type_names, $log_ctx, false );
+        $tag_names = ( ! empty( $data['Tags'] ) && is_array( $data['Tags'] ) ) ? $data['Tags'] : [];
+        _aco_re_set_post_terms_from_names( (int) $post_id, 'universal_tag', $tag_names, $log_ctx, true );
+
+        // File handling
+        if ( array_key_exists( 'FileURL', $data ) ) {
+            $file_url = is_string( $data['FileURL'] ) ? trim( $data['FileURL'] ) : '';
+            if ( $file_url !== '' ) {
+                $file_result = _aco_re_sideload_and_attach_file( (int) $post_id, $file_url );
+                if ( is_wp_error( $file_result ) ) {
+                    $log_ctx['error']   = $file_result->get_error_message();
+                    $log_ctx['payload'] = [ 'FileURL' => $file_url ];
+                    aco_re_log( 'warning', 'File handling failed.', $log_ctx );
                 }
+            } else {
+                aco_re_clear_primary_attachment( (int) $post_id );
+                aco_re_log( 'info', 'Cleared primary attachment due to empty FileURL.', [ 'record_id' => $record_id, 'post_id'   => (int) $post_id, 'action' => 'file_clear' ] );
             }
         }
+        
+        // --- LOG FINAL STATUS ---
         if ( $action === 'create' ) {
             aco_re_log( 'info', 'ACCEPTED CREATE.', [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'action' => 'create' ] );
             return [ 'status' => 'created', 'post_id' => (int) $post_id, 'reason' => null ];
+        } else {
+            aco_re_log( 'info', 'ACCEPTED UPDATE.', [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => 'update' ] );
+            return [ 'status' => 'updated', 'post_id' => $post_id, 'reason' => null ];
         }
-        aco_re_log( 'info', 'ACCEPTED UPDATE.', [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => 'update' ] );
-        return [ 'status' => 'updated', 'post_id' => $post_id, 'reason' => null ];
+
     } catch ( Throwable $e ) {
         aco_re_log( 'error', 'Unhandled exception.', [ 'record_id' => $record_id, 'exception' => $e->getMessage(), 'action' => 'exception' ] );
         return [ 'status' => 'error', 'post_id' => null, 'reason' => 'exception' ];
@@ -1404,6 +1391,7 @@ function aco_re_process_resource_sync_action( $payload ) {
         aco_re_release_lock( $record_id );
     }
 }
+
 
 // --- Hook Registrations ---
 
