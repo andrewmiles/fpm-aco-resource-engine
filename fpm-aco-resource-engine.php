@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.16
+ * Version:         1.17.17
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -235,9 +235,9 @@ function aco_re_render_tag_refresh_button() {
 }
 
 function aco_re_refresh_tag_allowlist() {
-    $api_key  = getenv( 'ACO_AT_API_KEY' );
-    $base_id  = getenv( 'ACO_AT_BASE_ID' );
-    $table_id = getenv( 'ACO_AT_TABLE_TAGS' );
+    $api_key  = _aco_re_get_config( 'ACO_AT_API_KEY' );
+    $base_id  = _aco_re_get_config( 'ACO_AT_BASE_ID' );
+    $table_id = _aco_re_get_config( 'ACO_AT_TABLE_TAGS' );
 
     if ( ! $api_key || ! $base_id || ! $table_id ) { return new WP_Error( 'aco_re_missing_creds', __( 'Airtable API credentials are not configured in environment variables.', 'fpm-aco-resource-engine' ) ); }
 
@@ -662,19 +662,9 @@ function aco_re_get_header( WP_REST_Request $request, $base_key ) {
 }
 
 function aco_re_get_webhook_secrets() {
-    $primary   = getenv( 'ACO_WEBHOOK_SECRET_PRIMARY' );
-    $secondary = getenv( 'ACO_WEBHOOK_SECRET_SECONDARY' );
-    if ( ! $primary && defined( 'ACO_WEBHOOK_SECRET_PRIMARY' ) ) { $primary = ACO_WEBHOOK_SECRET_PRIMARY; }
-    if ( ! $secondary && defined( 'ACO_WEBHOOK_SECRET_SECONDARY' ) ) { $secondary = ACO_WEBHOOK_SECRET_SECONDARY; }
-    if ( ! $primary ) {
-        $opt = get_option( 'aco_webhook_secret_primary' );
-        if ( is_string( $opt ) && $opt !== '' ) { $primary = $opt; }
-    }
-    if ( ! $secondary ) {
-        $opt = get_option( 'aco_webhook_secret_secondary' );
-        if ( is_string( $opt ) && $opt !== '' ) { $secondary = $opt; }
-    }
-    return [ $primary ?: null, $secondary ?: null ];
+    $primary   = _aco_re_get_config( 'ACO_WEBHOOK_SECRET_PRIMARY' );
+    $secondary = _aco_re_get_config( 'ACO_WEBHOOK_SECRET_SECONDARY' );
+    return [ $primary, $secondary ];
 }
 
 function aco_re_decode_signature_to_binary( $sig_raw ) {
@@ -1370,32 +1360,67 @@ function aco_re_process_resource_sync_action( $payload ) {
 // Requires env vars per Implementation Spec v1 §3: ACO_AT_API_KEY, ACO_AT_BASE_ID, ACO_AT_TABLE_RESOURCES.
 
 /**
- * Small Airtable helper for making GET requests with pagination, headers, and timeout.
+ * Central helper to retrieve configuration values.
+ * It checks for a defined constant first, then falls back to an environment variable.
+ */
+function _aco_re_get_config( string $key ) {
+    // Prefer constants defined in wp-config.php
+    if ( defined( $key ) ) {
+        $val = constant( $key );
+        if ( $val !== null && $val !== '' ) {
+            return $val;
+        }
+    }
+    // Fallbacks for environments where getenv() may be empty under WP-CLI wrappers
+    foreach ( [ $_ENV, $_SERVER ] as $src ) {
+        if ( isset( $src[ $key ] ) && $src[ $key ] !== '' ) {
+            return $src[ $key ];
+        }
+    }
+    $env = getenv( $key );
+    return ( $env !== false && $env !== '' ) ? $env : null;
+}
+
+/**
+ * Small Airtable helper for making GET requests (Patched to use _aco_re_get_config).
  */
 function _aco_re_airtable_get( string $table_id, array $query = [] ) {
-    $api_key = getenv('ACO_AT_API_KEY');
-    $base_id = getenv('ACO_AT_BASE_ID');
+    $api_key = _aco_re_get_config( 'ACO_AT_API_KEY' );
+    $base_id = _aco_re_get_config( 'ACO_AT_BASE_ID' );
     if ( ! $api_key || ! $base_id || ! $table_id ) {
         return new WP_Error( 'aco_re_missing_creds', 'Airtable API credentials are not configured.' );
     }
+
     $endpoint = "https://api.airtable.com/v0/{$base_id}/{$table_id}";
-    $args     = [
-        'headers'     => [ 'Authorization' => 'Bearer ' . $api_key ],
+    $url      = add_query_arg( $query, $endpoint );
+
+    $args = [
+        'headers'     => [
+            'Authorization' => 'Bearer ' . $api_key,
+            'Accept'        => 'application/json',
+        ],
         'timeout'     => 20,
-        'redirection' => 0,
+        'redirection' => 3,
     ];
-    $url = add_query_arg( $query, $endpoint );
+
     $res = wp_remote_get( $url, $args );
-    if ( is_wp_error( $res ) ) { return $res; }
-    $code = (int) wp_remote_retrieve_response_code( $res );
-    if ( 200 !== $code ) {
-        return new WP_Error( 'aco_re_api_error', 'Airtable API error ' . $code );
+    if ( is_wp_error( $res ) ) {
+        return $res;
     }
-    $body = wp_remote_retrieve_body( $res );
+
+    $code = (int) wp_remote_retrieve_response_code( $res );
+    $body = (string) wp_remote_retrieve_body( $res );
+
+    if ( 200 !== $code ) {
+        $snippet = mb_substr( trim( $body ), 0, 300 );
+        return new WP_Error( 'aco_re_api_error', sprintf( 'Airtable API error %d: %s', $code, $snippet ) );
+    }
+
     $data = json_decode( $body, true );
     if ( ! is_array( $data ) ) {
         return new WP_Error( 'aco_re_bad_json', 'Invalid JSON from Airtable.' );
     }
+
     return $data;
 }
 
@@ -1442,8 +1467,10 @@ function aco_re_run_nightly_delta_sync() {
  * Stage 1: Fetches new/updated records and enqueues them for processing.
  */
 function _aco_re_nightly_sync_upserts( string $sync_id ) {
-    $table_id = getenv( 'ACO_AT_TABLE_RESOURCES' );
-    if ( ! $table_id ) return new WP_Error( 'aco_re_missing_table', 'ACO_AT_TABLE_RESOURCES is not configured.' );
+    $table_id = _aco_re_get_config( 'ACO_AT_TABLE_RESOURCES' );
+    if ( ! $table_id ) {
+        return new WP_Error( 'aco_re_missing_table', 'ACO_AT_TABLE_RESOURCES is not configured.' );
+    }
 
     $cursor_iso = get_option( 'aco_re_nightly_sync_cursor', '' );
     if ( empty( $cursor_iso ) ) {
@@ -1453,46 +1480,43 @@ function _aco_re_nightly_sync_upserts( string $sync_id ) {
     $fields = [ 'Title','Summary','FileURL','Tags','Type','DocumentDate','LastModified' ];
     $query  = [
         'pageSize'        => 100,
-        'filterByFormula' => sprintf( 'IS_AFTER({LastModified}, "%s")', esc_sql( $cursor_iso ) ),
+        'filterByFormula' => sprintf( 'IS_AFTER({LastModified}, "%s")', $cursor_iso ),
+        'fields'          => $fields,
     ];
-    // This is a workaround for how add_query_arg handles array parameters.
-    $query_string_for_fields = http_build_query( [ 'fields' => $fields ] );
 
-    $enqueued = 0;
+    $enqueued  = 0;
     $guard_max = (int) apply_filters( 'aco_re_nightly_sync_max_items', 5000 );
-    $seen = 0;
-    $offset = null;
+    $seen      = 0;
+    $offset    = null;
 
     do {
-        if ( $offset ) { $query['offset'] = $offset; } else { unset( $query['offset'] ); }
-        
-        // Temporarily remove fields from the query array to manually append them.
-        $temp_query = $query;
-        $data = _aco_re_airtable_get( $table_id, $temp_query );
-        
-        // This is a bit of a hack to add the fields correctly without them being encoded.
-        // The _aco_re_airtable_get function needs to be adapted to handle this better in a future version.
-        // For now, we manually construct the URL for the first page.
-        if (is_array($data) && !isset($data['offset'])) {
-            $data = _aco_re_airtable_get( $table_id, $query_string_for_fields . '&' . http_build_query($temp_query) );
+        if ( $offset ) {
+            $query['offset'] = $offset;
+        } else {
+            unset( $query['offset'] );
         }
 
-        if ( is_wp_error( $data ) ) { return $data; }
+        $data = _aco_re_airtable_get( $table_id, $query );
+        if ( is_wp_error( $data ) ) {
+            return $data;
+        }
 
-        $records = isset( $data['records'] ) && is_array( $data['records'] ) ? $data['records'] : [];
+        $records = ( isset( $data['records'] ) && is_array( $data['records'] ) ) ? $data['records'] : [];
         foreach ( $records as $rec ) {
-            if ( ! isset( $rec['id'] ) || empty( $rec['fields'] ) || ! is_array( $rec['fields'] ) ) { continue; }
+            if ( empty( $rec['id'] ) || empty( $rec['fields'] ) || ! is_array( $rec['fields'] ) ) {
+                continue;
+            }
 
-            $fields_data = $rec['fields'];
+            $f = $rec['fields'];
             $payload = [
                 'record_id'    => (string) $rec['id'],
-                'Title'        => (string) ( $fields_data['Title'] ?? '' ),
-                'Summary'      => (string) ( $fields_data['Summary'] ?? '' ),
-                'FileURL'      => (string) ( $fields_data['FileURL'] ?? '' ),
-                'Type'         => (string) ( $fields_data['Type'] ?? '' ),
-                'DocumentDate' => (string) ( $fields_data['DocumentDate'] ?? '' ),
-                'LastModified' => (string) ( $fields_data['LastModified'] ?? '' ),
-                'Tags'         => is_array( $fields_data['Tags'] ?? null ) ? array_values( $fields_data['Tags'] ) : [],
+                'Title'        => (string) ( $f['Title'] ?? '' ),
+                'Summary'      => (string) ( $f['Summary'] ?? '' ),
+                'FileURL'      => (string) ( $f['FileURL'] ?? '' ),
+                'Type'         => (string) ( $f['Type'] ?? '' ),
+                'DocumentDate' => (string) ( $f['DocumentDate'] ?? '' ),
+                'LastModified' => (string) ( $f['LastModified'] ?? '' ),
+                'Tags'         => is_array( $f['Tags'] ?? null ) ? array_values( $f['Tags'] ) : [],
             ];
 
             if ( aco_re_enqueue_sync_job( $payload ) ) {
@@ -1501,15 +1525,23 @@ function _aco_re_nightly_sync_upserts( string $sync_id ) {
         }
 
         $seen   += count( $records );
-        $offset  = isset( $data['offset'] ) ? $data['offset'] : null;
+        $offset  = $data['offset'] ?? null;
 
         if ( $seen >= $guard_max ) {
-            aco_re_log( 'warning', 'Nightly upserts capped by guard_max.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'guard_max' => $guard_max ] );
+            aco_re_log(
+                'warning',
+                'Nightly upserts capped by guard_max.',
+                [ 'source' => 'nightly', 'sync_id' => $sync_id, 'guard_max' => $guard_max ]
+            );
             break;
         }
     } while ( $offset );
 
-    aco_re_log( 'info', 'Stage 1 (Upserts) completed.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'enqueued' => $enqueued, 'cursor' => $cursor_iso ] );
+    aco_re_log(
+        'info',
+        'Stage 1 (Upserts) completed.',
+        [ 'source' => 'nightly', 'sync_id' => $sync_id, 'enqueued' => $enqueued, 'cursor' => $cursor_iso ]
+    );
     return [ 'enqueued' => $enqueued ];
 }
 
@@ -1518,7 +1550,7 @@ function _aco_re_nightly_sync_upserts( string $sync_id ) {
  */
 function _aco_re_nightly_sync_deletes( string $sync_id ) {
     global $wpdb;
-    $table_id = getenv( 'ACO_AT_TABLE_RESOURCES' );
+    $table_id = _aco_re_get_config( 'ACO_AT_TABLE_RESOURCES' );
     if ( ! $table_id ) return new WP_Error( 'aco_re_missing_table', 'ACO_AT_TABLE_RESOURCES is not configured.' );
 
     $airtable_ids = [];
