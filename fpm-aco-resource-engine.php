@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.17
+ * Version:         1.17.19
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1477,11 +1477,11 @@ function _aco_re_nightly_sync_upserts( string $sync_id ) {
         $cursor_iso = gmdate( 'c', time() - DAY_IN_SECONDS );
     }
 
-    $fields = [ 'Title','Summary','FileURL','Tags','Type','DocumentDate','LastModified' ];
+    // Schema-agnostic: filter by computed LAST_MODIFIED_TIME() and do NOT restrict fields.
     $query  = [
         'pageSize'        => 100,
-        'filterByFormula' => sprintf( 'IS_AFTER({LastModified}, "%s")', $cursor_iso ),
-        'fields'          => $fields,
+        'filterByFormula' => sprintf( 'IS_AFTER(LAST_MODIFIED_TIME(), "%s")', $cursor_iso ),
+        // Intentionally no 'fields' param to avoid 422 when names differ.
     ];
 
     $enqueued  = 0;
@@ -1507,16 +1507,40 @@ function _aco_re_nightly_sync_upserts( string $sync_id ) {
                 continue;
             }
 
-            $f = $rec['fields'];
+            $f = is_array( $rec['fields'] ?? null ) ? $rec['fields'] : [];
+
+            // Robust getters with common fallbacks
+            $title        = aco_re_get_first_string( $f, [ 'Title', 'Name' ] );
+            $summary      = aco_re_get_first_string( $f, [ 'Summary', 'Description', 'Notes' ] );
+            $file_url     = aco_re_get_first_string( $f, [ 'FileURL', 'File Url', 'File URL', 'URL' ] );
+            $type_value   = aco_re_get_first_string( $f, [ 'Type', 'Resource Type', 'Types' ] );
+            $documentDate = aco_re_get_first_string( $f, [ 'DocumentDate', 'Document Date', 'Date' ] );
+            $lastModified = aco_re_get_first_string( $f, [ 'LastModified', 'Last Modified', 'Last modified time' ] );
+
+            // Tags can be either an array or a comma-separated string
+            $tags = [];
+            if ( isset( $f['Tags'] ) ) {
+                if ( is_array( $f['Tags'] ) ) {
+                    $tags = array_values( array_filter( array_map( 'strval', $f['Tags'] ) ) );
+                } elseif ( is_string( $f['Tags'] ) ) {
+                    $tags = array_values( array_filter( array_map( 'trim', explode( ',', $f['Tags'] ) ) ) );
+                }
+            }
+
+            // Fallback for last modified (we filtered by LAST_MODIFIED_TIME() already)
+            if ( $lastModified === '' ) {
+                $lastModified = gmdate( 'c' );
+            }
+
             $payload = [
                 'record_id'    => (string) $rec['id'],
-                'Title'        => (string) ( $f['Title'] ?? '' ),
-                'Summary'      => (string) ( $f['Summary'] ?? '' ),
-                'FileURL'      => (string) ( $f['FileURL'] ?? '' ),
-                'Type'         => (string) ( $f['Type'] ?? '' ),
-                'DocumentDate' => (string) ( $f['DocumentDate'] ?? '' ),
-                'LastModified' => (string) ( $f['LastModified'] ?? '' ),
-                'Tags'         => is_array( $f['Tags'] ?? null ) ? array_values( $f['Tags'] ) : [],
+                'Title'        => (string) $title,
+                'Summary'      => (string) $summary,
+                'FileURL'      => (string) $file_url,
+                'Type'         => (string) $type_value,
+                'DocumentDate' => (string) $documentDate,
+                'LastModified' => (string) $lastModified,
+                'Tags'         => $tags,
             ];
 
             if ( aco_re_enqueue_sync_job( $payload ) ) {
@@ -1554,7 +1578,8 @@ function _aco_re_nightly_sync_deletes( string $sync_id ) {
     if ( ! $table_id ) return new WP_Error( 'aco_re_missing_table', 'ACO_AT_TABLE_RESOURCES is not configured.' );
 
     $airtable_ids = [];
-    $query = [ 'pageSize' => 100, 'fields' => ['LastModified'] ]; // Fetch any field, we only need the record ID.
+    // No fields restriction; we only need IDs and want to avoid 422 on unknown field names.
+    $query = [ 'pageSize' => 100 ];
     $offset = null;
 
     do {
