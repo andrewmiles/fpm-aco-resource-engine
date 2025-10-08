@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.15
+ * Version:         1.17.16
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1366,17 +1366,288 @@ function aco_re_process_resource_sync_action( $payload ) {
 }
 
 
+// --- Nightly Delta Sync (Spec-aligned, safe) ---
+// Requires env vars per Implementation Spec v1 §3: ACO_AT_API_KEY, ACO_AT_BASE_ID, ACO_AT_TABLE_RESOURCES.
+
+/**
+ * Small Airtable helper for making GET requests with pagination, headers, and timeout.
+ */
+function _aco_re_airtable_get( string $table_id, array $query = [] ) {
+    $api_key = getenv('ACO_AT_API_KEY');
+    $base_id = getenv('ACO_AT_BASE_ID');
+    if ( ! $api_key || ! $base_id || ! $table_id ) {
+        return new WP_Error( 'aco_re_missing_creds', 'Airtable API credentials are not configured.' );
+    }
+    $endpoint = "https://api.airtable.com/v0/{$base_id}/{$table_id}";
+    $args     = [
+        'headers'     => [ 'Authorization' => 'Bearer ' . $api_key ],
+        'timeout'     => 20,
+        'redirection' => 0,
+    ];
+    $url = add_query_arg( $query, $endpoint );
+    $res = wp_remote_get( $url, $args );
+    if ( is_wp_error( $res ) ) { return $res; }
+    $code = (int) wp_remote_retrieve_response_code( $res );
+    if ( 200 !== $code ) {
+        return new WP_Error( 'aco_re_api_error', 'Airtable API error ' . $code );
+    }
+    $body = wp_remote_retrieve_body( $res );
+    $data = json_decode( $body, true );
+    if ( ! is_array( $data ) ) {
+        return new WP_Error( 'aco_re_bad_json', 'Invalid JSON from Airtable.' );
+    }
+    return $data;
+}
+
+/**
+ * Main orchestrator for the nightly sync cron job.
+ */
+function aco_re_run_nightly_delta_sync() {
+    $start_ts = time();
+    $sync_id  = uniqid('sync_', true);
+    $summary  = [
+        'enqueued_upserts' => 0,
+        'deleted'          => 0,
+        'errors'           => [],
+        'start_time'       => gmdate('c', $start_ts),
+        'end_time'         => '',
+        'duration_s'       => 0,
+    ];
+
+    aco_re_log( 'info', 'Nightly sync started.', [ 'source' => 'nightly', 'sync_id' => $sync_id ] );
+
+    try {
+        $upserts = _aco_re_nightly_sync_upserts( $sync_id );
+        if ( is_wp_error( $upserts ) ) { throw new Exception( $upserts->get_error_message() ); }
+        $summary['enqueued_upserts'] = (int) $upserts['enqueued'];
+
+        $deletes = _aco_re_nightly_sync_deletes( $sync_id );
+        if ( is_wp_error( $deletes ) ) { throw new Exception( $deletes->get_error_message() ); }
+        $summary['deleted'] = (int) $deletes['deleted'];
+
+        update_option( 'aco_re_nightly_sync_cursor', $summary['start_time'] );
+        aco_re_log( 'info', 'Nightly sync completed.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'summary' => $summary ] );
+
+    } catch ( Throwable $e ) {
+        $summary['errors'][] = $e->getMessage();
+        aco_re_log( 'error', 'Nightly sync failed: ' . $e->getMessage(), [ 'source' => 'nightly', 'sync_id' => $sync_id, 'exception' => $e->getMessage() ] );
+    }
+
+    $summary['end_time']   = gmdate( 'c' );
+    $summary['duration_s'] = max( 0, time() - $start_ts );
+    _aco_re_nightly_sync_send_summary_email( $summary );
+}
+
+/**
+ * Stage 1: Fetches new/updated records and enqueues them for processing.
+ */
+function _aco_re_nightly_sync_upserts( string $sync_id ) {
+    $table_id = getenv( 'ACO_AT_TABLE_RESOURCES' );
+    if ( ! $table_id ) return new WP_Error( 'aco_re_missing_table', 'ACO_AT_TABLE_RESOURCES is not configured.' );
+
+    $cursor_iso = get_option( 'aco_re_nightly_sync_cursor', '' );
+    if ( empty( $cursor_iso ) ) {
+        $cursor_iso = gmdate( 'c', time() - DAY_IN_SECONDS );
+    }
+
+    $fields = [ 'Title','Summary','FileURL','Tags','Type','DocumentDate','LastModified' ];
+    $query  = [
+        'pageSize'        => 100,
+        'filterByFormula' => sprintf( 'IS_AFTER({LastModified}, "%s")', esc_sql( $cursor_iso ) ),
+    ];
+    // This is a workaround for how add_query_arg handles array parameters.
+    $query_string_for_fields = http_build_query( [ 'fields' => $fields ] );
+
+    $enqueued = 0;
+    $guard_max = (int) apply_filters( 'aco_re_nightly_sync_max_items', 5000 );
+    $seen = 0;
+    $offset = null;
+
+    do {
+        if ( $offset ) { $query['offset'] = $offset; } else { unset( $query['offset'] ); }
+        
+        // Temporarily remove fields from the query array to manually append them.
+        $temp_query = $query;
+        $data = _aco_re_airtable_get( $table_id, $temp_query );
+        
+        // This is a bit of a hack to add the fields correctly without them being encoded.
+        // The _aco_re_airtable_get function needs to be adapted to handle this better in a future version.
+        // For now, we manually construct the URL for the first page.
+        if (is_array($data) && !isset($data['offset'])) {
+            $data = _aco_re_airtable_get( $table_id, $query_string_for_fields . '&' . http_build_query($temp_query) );
+        }
+
+        if ( is_wp_error( $data ) ) { return $data; }
+
+        $records = isset( $data['records'] ) && is_array( $data['records'] ) ? $data['records'] : [];
+        foreach ( $records as $rec ) {
+            if ( ! isset( $rec['id'] ) || empty( $rec['fields'] ) || ! is_array( $rec['fields'] ) ) { continue; }
+
+            $fields_data = $rec['fields'];
+            $payload = [
+                'record_id'    => (string) $rec['id'],
+                'Title'        => (string) ( $fields_data['Title'] ?? '' ),
+                'Summary'      => (string) ( $fields_data['Summary'] ?? '' ),
+                'FileURL'      => (string) ( $fields_data['FileURL'] ?? '' ),
+                'Type'         => (string) ( $fields_data['Type'] ?? '' ),
+                'DocumentDate' => (string) ( $fields_data['DocumentDate'] ?? '' ),
+                'LastModified' => (string) ( $fields_data['LastModified'] ?? '' ),
+                'Tags'         => is_array( $fields_data['Tags'] ?? null ) ? array_values( $fields_data['Tags'] ) : [],
+            ];
+
+            if ( aco_re_enqueue_sync_job( $payload ) ) {
+                $enqueued++;
+            }
+        }
+
+        $seen   += count( $records );
+        $offset  = isset( $data['offset'] ) ? $data['offset'] : null;
+
+        if ( $seen >= $guard_max ) {
+            aco_re_log( 'warning', 'Nightly upserts capped by guard_max.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'guard_max' => $guard_max ] );
+            break;
+        }
+    } while ( $offset );
+
+    aco_re_log( 'info', 'Stage 1 (Upserts) completed.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'enqueued' => $enqueued, 'cursor' => $cursor_iso ] );
+    return [ 'enqueued' => $enqueued ];
+}
+
+/**
+ * Stage 2: Finds and soft-deletes WordPress records that are no longer in Airtable.
+ */
+function _aco_re_nightly_sync_deletes( string $sync_id ) {
+    global $wpdb;
+    $table_id = getenv( 'ACO_AT_TABLE_RESOURCES' );
+    if ( ! $table_id ) return new WP_Error( 'aco_re_missing_table', 'ACO_AT_TABLE_RESOURCES is not configured.' );
+
+    $airtable_ids = [];
+    $query = [ 'pageSize' => 100, 'fields' => ['LastModified'] ]; // Fetch any field, we only need the record ID.
+    $offset = null;
+
+    do {
+        if ( $offset ) { $query['offset'] = $offset; } else { unset( $query['offset'] ); }
+        $data = _aco_re_airtable_get( $table_id, $query );
+        if ( is_wp_error( $data ) ) { return $data; }
+
+        $records = isset( $data['records'] ) && is_array( $data['records'] ) ? $data['records'] : [];
+        foreach ( $records as $rec ) {
+            if ( isset( $rec['id'] ) ) { $airtable_ids[$rec['id']] = true; }
+        }
+        $offset = isset( $data['offset'] ) ? $data['offset'] : null;
+    } while ( $offset );
+
+    if ( empty( $airtable_ids ) ) {
+        aco_re_log( 'warning', 'Stage 2 aborted: Airtable returned zero IDs. No records will be deleted.', [ 'source' => 'nightly', 'sync_id' => $sync_id ] );
+        return [ 'deleted' => 0 ];
+    }
+
+    $wp_map = [];
+    $batch  = 2000;
+    $last_id = 0;
+
+    do {
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT pm.post_id, pm.meta_value AS record_id
+                 FROM {$wpdb->postmeta} pm
+                 WHERE pm.meta_key = %s AND pm.post_id > %d
+                 ORDER BY pm.post_id ASC
+                 LIMIT %d",
+                ACO_AT_RECORD_ID_META,
+                $last_id,
+                $batch
+            )
+        );
+        if ( empty( $rows ) ) { break; }
+        foreach ( $rows as $r ) {
+            $wp_map[ (string) $r->record_id ] = (int) $r->post_id;
+            $last_id = (int) $r->post_id;
+        }
+    } while ( count( $rows ) === $batch );
+
+    $to_delete = array_diff_key( $wp_map, $airtable_ids );
+    $deleted = 0;
+
+    foreach ( $to_delete as $record_id => $post_id ) {
+        $p = get_post( $post_id );
+        if ( ! $p || $p->post_type !== 'resource' || $p->post_status !== 'publish' ) { continue; }
+
+        $ok = wp_update_post( [ 'ID' => $post_id, 'post_status' => 'private' ], true );
+        if ( ! is_wp_error( $ok ) ) {
+            update_post_meta( $post_id, '_aco_sync_deleted_on', gmdate( 'c' ) );
+            $deleted++;
+            aco_re_log( 'info', 'Soft-deleted resource.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'post_id' => $post_id, 'record_id' => $record_id ] );
+        } else {
+            aco_re_log( 'warning', 'Soft-delete failed.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'post_id' => $post_id, 'record_id' => $record_id, 'error' => $ok->get_error_message() ] );
+        }
+    }
+
+    aco_re_log( 'info', 'Stage 2 (Deletes) completed.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'deleted_count' => $deleted ] );
+    return [ 'deleted' => $deleted ];
+}
+
+/**
+ * Sends the nightly sync summary email.
+ */
+function _aco_re_nightly_sync_send_summary_email( array $summary ) {
+    $to = apply_filters( 'aco_re_nightly_sync_email_to', get_option( 'admin_email' ) );
+    $subject = sprintf(
+        '[%s] Airtable Nightly Sync: %s',
+        wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES ),
+        empty( $summary['errors'] ) ? 'Success' : 'FAILED'
+    );
+
+    $body  = "Airtable to WordPress nightly sync completed.
+
+";
+    $body .= "Start:    {$summary['start_time']} UTC
+";
+    $body .= "End:      {$summary['end_time']} UTC
+";
+    $body .= "Duration: {$summary['duration_s']} seconds
+";
+    $body .= "-----------------------------------------
+";
+    $body .= "Upserts enqueued: {$summary['enqueued_upserts']}
+";
+    $body .= "Soft-deleted:     {$summary['deleted']}
+";
+    if ( ! empty( $summary['errors'] ) ) {
+        $body .= "-----------------------------------------
+Errors:
+";
+        foreach ( (array) $summary['errors'] as $e ) { $body .= "- {$e}
+"; }
+    }
+
+    wp_mail( $to, $subject, $body );
+}
+
+/**
+ * Schedules the nightly sync to run at 02:30 UTC.
+ */
+function aco_re_schedule_nightly_sync() {
+    if ( ! wp_next_scheduled( 'aco_re_nightly_delta_sync_hook' ) ) {
+        $ts = strtotime( 'tomorrow 02:30:00 UTC' );
+        wp_schedule_event( $ts, 'daily', 'aco_re_nightly_delta_sync_hook' );
+    }
+}
+
+/**
+ * Clears the nightly sync cron job on deactivation.
+ */
+function aco_re_clear_nightly_sync() {
+    wp_clear_scheduled_hook( 'aco_re_nightly_delta_sync_hook' );
+}
+
+
 // --- Hook Registrations ---
 
 // --- Activation / Deactivation / Uninstall Hooks ---
 
 register_activation_hook( __FILE__, function () {
-    update_option('aco_re_activation_test', time()); // <-- ADD THIS LINE
-
-    // Call the function to create the table
-    aco_re_create_sync_log_table(); 
-
-    // Original activation logic
+    aco_re_create_sync_log_table();
     if ( $admin_role = get_role( 'administrator' ) ) {
         $admin_role->add_cap( 'aco_manage_failover' );
     }
@@ -1384,32 +1655,34 @@ register_activation_hook( __FILE__, function () {
     if ( ! wp_next_scheduled( 'aco_re_hourly_tag_sync_hook' ) ) {
         wp_schedule_event( time(), 'hourly', 'aco_re_hourly_tag_sync_hook' );
     }
+    aco_re_schedule_nightly_sync(); // Add this line
     aco_re_register_content_models();
     flush_rewrite_rules();
 } );
 
 register_deactivation_hook( __FILE__, function () {
     wp_clear_scheduled_hook( 'aco_re_hourly_tag_sync_hook' );
+    aco_re_clear_nightly_sync(); // Add this line
     flush_rewrite_rules();
 } );
 
 register_uninstall_hook( __FILE__, 'aco_re_on_uninstall' );
 
 
+// --- Main Plugin Hooks ---
 
-
+add_action( 'init', 'aco_re_register_content_models' );
+add_action( 'init', 'aco_re_seed_terms_conditionally', 20 );
+add_action( 'init', 'aco_re_ensure_admin_capability', 1 );
 add_action( 'init', 'aco_re_register_log_purge_cron' );
 add_action( 'aco_re_daily_log_purge', 'aco_re_purge_old_logs' );
-
-
+add_action( 'aco_re_nightly_delta_sync_hook', 'aco_re_run_nightly_delta_sync' ); // Add this line
 
 add_action( 'admin_init', 'aco_re_register_settings' );
 add_action( 'admin_init', 'aco_re_register_tag_governance_settings' );
 add_action( 'admin_init', 'aco_re_handle_manual_tag_refresh' );
+
 add_action( 'plugins_loaded', 'aco_re_load_text_domain' );
-add_action( 'init', 'aco_re_register_content_models' );
-add_action( 'init', 'aco_re_seed_terms_conditionally', 20 );
-add_action( 'init', 'aco_re_ensure_admin_capability', 1 );
 add_action( 'admin_menu', 'aco_re_register_settings_page' );
 add_action( 'admin_enqueue_scripts', 'aco_re_enqueue_linter_script' );
 add_action( 'wp_dashboard_setup', 'aco_re_register_dashboard_widget' );
@@ -1423,9 +1696,7 @@ add_filter( 'wp_calculate_image_srcset', 'aco_re_failover_srcset_swap', 99 );
 add_filter( 'wp_get_attachment_image_attributes', 'aco_re_failover_img_attr_swap', 99 );
 add_filter( 'site_status_tests', 'aco_re_add_site_health_test' );
 add_action('plugins_loaded', function() {
-        // First, check if ACF Pro is active to prevent errors if it's disabled.
     if (function_exists('acf_is_pro') && acf_is_pro()) {
-        // Add the filter, now that we know it's safe to do so.
         add_filter('acf/settings/remove_wp_meta_box', '__return_false');
     }
 });
