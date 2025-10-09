@@ -1,48 +1,89 @@
-/**
- * ACO Resource Engine - Promote to Resource UI
+/** admin/promoter.js — Drop-in replacement
  *
- * Displays a toast notification after a PDF is uploaded, offering to promote it
- * to a canonical Resource post type.
+ * ACO Resource Engine — Promote to Resource UI
+ * - Robust upload detection via apiFetch middleware (covers block editor uploads, drag/drop, File block “Upload”)
+ * - Fallback hook for media frame insertions via wp.media.editor.send.attachment
+ * - A11y announcements (speak: true), safe notice actions (no HTML injection)
+ * - Correct notice ID handling; prevents duplicate initialisation; hardened PDF checks
  */
 (function (wp) {
-  const { apiFetch } = wp;
-  const { select, subscribe } = wp.data;
-  const { createNotice } = wp.notices;
-  const { __ } = wp.i18n;
+  if (!wp) return;
 
-  // Ensure we don't act on the same attachment multiple times per session.
+  const { apiFetch, element, i18n, data } = wp;
+  const { createElement: el } = element || { createElement: null };
+  const { __ } = i18n || { __: (s) => s };
+  const { select, dispatch } = data || {};
+
+  // Permission gate from PHP (capability check)
+  if (!window.acoPromoterData || !window.acoPromoterData.can_create_resource) {
+    return;
+  }
+
+  // Prevent double-mounting across navigations/hot reloads
+  if (window.__acoPromoterMounted) {
+    return;
+  }
+  window.__acoPromoterMounted = true;
+
+  const notices = dispatch && dispatch('core/notices');
   const processedAttachments = new Set();
 
+  function isPdf(attachment) {
+    const mime =
+      (attachment && (attachment.mime || attachment.mime_type || attachment.type)) || '';
+    return mime === 'application/pdf';
+  }
+
+  function getSourcePostId() {
+    try {
+      const editorStore = select && select('core/editor');
+      if (editorStore && typeof editorStore.getCurrentPostId === 'function') {
+        return editorStore.getCurrentPostId();
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function showInfoToast(id, actions = []) {
+    return notices.createNotice(
+      'info',
+      __('This PDF can be promoted to the Resource Library.', 'fpm-aco-resource-engine'),
+      {
+        id,
+        type: 'snackbar',
+        isDismissible: true,
+        explicitDismiss: true,
+        speak: true,
+        actions, // [{ label, url } or { label, onClick }]
+      }
+    );
+  }
+
   function handleNewAttachment(attachment) {
-    // Check permissions passed from PHP.
-    if (!window.acoPromoterData || !window.acoPromoterData.can_create_resource) {
-      return;
-    }
+    if (!attachment || !attachment.id) return;
+    if (!isPdf(attachment)) return;
 
     if (processedAttachments.has(attachment.id)) {
       return;
     }
-
-    // Only act on PDFs.
-    if (!attachment.mime || attachment.mime !== 'application/pdf') {
-      return;
-    }
-
     processedAttachments.add(attachment.id);
 
     const noticeId = `aco-promote-${attachment.id}`;
 
     const promoteAction = {
       label: __('Promote to Resource', 'fpm-aco-resource-engine'),
-      callback: () => {
-        wp.data.dispatch('core/notices').removeNotice(noticeId);
-        const busyNotice = createNotice('info', __('Promoting...', 'fpm-aco-resource-engine'), {
-          isDismissible: false,
-        });
+      onClick: () => {
+        // Dismiss the info toast if still visible
+        notices.removeNotice(noticeId);
 
-        // If we are in an editor context, get the post ID for link rewriting.
-        const editor = select('core/editor');
-        const sourcePostId = editor ? editor.getCurrentPostId() : null;
+        // Busy (non-dismissable) notice
+        const busyId = notices.createNotice(
+          'info',
+          __('Promoting...', 'fpm-aco-resource-engine'),
+          { isDismissible: false, speak: true }
+        );
+
+        const sourcePostId = getSourcePostId();
 
         apiFetch({
           path: '/aco/v1/promote',
@@ -53,53 +94,99 @@
           },
         })
           .then((response) => {
-            wp.data.dispatch('core/notices').removeNotice(busyNotice.id);
+            notices.removeNotice(busyId);
 
-            let message = response.message;
-            if (response.editLink) {
-              message += ` <a href="${response.editLink}" target="_blank" rel="noopener noreferrer">${__('Edit the new Resource.', 'fpm-aco-resource-engine')}</a>`;
+            const actions = [];
+            if (response && response.editLink) {
+              actions.push({
+                label: __('Edit the new Resource', 'fpm-aco-resource-engine'),
+                url: response.editLink,
+              });
             }
 
-            createNotice('success', message, {
-              isDismissible: true,
+            const message =
+              (response && response.message) ||
+              __('Promoted to Resource.', 'fpm-aco-resource-engine');
+
+            notices.createNotice('success', message, {
               type: 'snackbar',
+              isDismissible: true,
               explicitDismiss: true,
+              speak: true,
+              actions,
             });
           })
           .catch((error) => {
-            wp.data.dispatch('core/notices').removeNotice(busyNotice.id);
-            const errorMessage = error.message || __('An unknown error occurred.', 'fpm-aco-resource-engine');
-            createNotice('error', errorMessage, { isDismissible: true });
+            notices.removeNotice(busyId);
+            const errorMessage =
+              (error && error.message) ||
+              __('An unknown error occurred.', 'fpm-aco-resource-engine');
+            notices.createNotice('error', errorMessage, {
+              isDismissible: true,
+              speak: true,
+            });
           });
       },
     };
 
-    createNotice('info', __('This PDF can be promoted to the Resource Library.', 'fpm-aco-resource-engine'), {
-      id: noticeId,
-      isDismissible: true,
-      type: 'snackbar',
-      actions: [promoteAction],
+    // Initial toast with the Promote CTA
+    showInfoToast(noticeId, [promoteAction]);
+  }
+
+  // -------- Detection layer 1: apiFetch middleware (covers all editor uploads) --------
+  if (apiFetch && typeof apiFetch.use === 'function' && !window.__acoPromoterApiFetchPatched) {
+    window.__acoPromoterApiFetchPatched = true;
+
+    apiFetch.use((options, next) => {
+      const isCreateMedia =
+        options &&
+        typeof options.path === 'string' &&
+        options.path.indexOf('/wp/v2/media') === 0 &&
+        String(options.method || 'GET').toUpperCase() === 'POST';
+
+      return next(options).then((result) => {
+        try {
+          // If a media item was created and it's a PDF, trigger the toast
+          if (isCreateMedia && result && isPdf({ mime_type: result.mime_type })) {
+            handleNewAttachment({ id: result.id, mime_type: result.mime_type });
+          }
+        } catch (e) {
+          // no-op
+        }
+        return result;
+      });
     });
   }
 
-  // Hook into the media library data store.
-  let previousAttachments = [];
-  subscribe(() => {
-    // This targets newly uploaded items appearing in the main library view.
-    const newAttachments = select('core').getMediaItems({ per_page: 5, orderby: 'date', order: 'desc' }) || [];
+  // -------- Detection layer 2 (fallback): media frame insertion hook --------
+  try {
+    if (
+      wp.media &&
+      wp.media.editor &&
+      wp.media.editor.send &&
+      !wp.media.editor.__acoPromoterPatched
+    ) {
+      wp.media.editor.__acoPromoterPatched = true;
 
-    // --- DEBUGGING LINE ---
-    console.log('Upload detector fired. Found attachments:', newAttachments.map(att => att.id));
-    // --- END DEBUGGING ---
-
-    if (newAttachments.length > 0 && newAttachments !== previousAttachments) {
-      const latestAttachment = newAttachments[0];
-      const isAlreadyKnown = previousAttachments.some(att => att.id === latestAttachment.id);
-      if (!isAlreadyKnown) {
-        handleNewAttachment(latestAttachment);
-      }
+      const originalSend = wp.media.editor.send.attachment;
+      wp.media.editor.send.attachment = function (props, attachment) {
+        try {
+          if (attachment && isPdf(attachment)) {
+            handleNewAttachment(attachment);
+          }
+        } catch (e) {
+          // no-op
+        }
+        return originalSend.apply(this, arguments);
+      };
     }
-    previousAttachments = newAttachments;
-  });
+  } catch (e) {
+    // media frame not present; safe to ignore
+  }
 
+  // Optional dev logging, guarded by a flag
+  if (window.acoPromoterData && window.acoPromoterData.debug) {
+    const log = (...args) => (console && console.log ? console.log(...args) : null);
+    log('[ACO Promote] Mounted');
+  }
 })(window.wp);
