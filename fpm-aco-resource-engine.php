@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.22
+ * Version:         1.17.23
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1702,31 +1702,28 @@ function aco_re_clear_nightly_sync() {
 // --- Promote to Resource (Editor UX) ---
 
 /**
- * Enqueue the JavaScript for the "Promote to Resource" toast notification.
+ * Enqueue the "Promote to Resource" script specifically for the block editor,
+ * ensuring it runs where editor-initiated uploads happen.
  */
-function aco_re_enqueue_promoter_script() {
-    $screen = get_current_screen();
-    // Only load on screens where media uploads are likely.
-    if ( ! $screen || ! in_array( $screen->base, [ 'post', 'upload', 'media' ], true ) ) {
-        return;
-    }
-
+add_action('enqueue_block_editor_assets', function () {
+    $handle = 'aco-promoter';
     $script_path = plugin_dir_path( __FILE__ ) . 'admin/promoter.js';
-    if ( ! file_exists( $script_path ) ) {
-        return;
-    }
+    if ( ! file_exists( $script_path ) ) { return; }
 
-    $script_version = filemtime( $script_path );
-    $script_url     = plugins_url( 'admin/promoter.js', __FILE__ );
-    wp_enqueue_script( 'aco-promoter', $script_url, [ 'wp-api-fetch', 'wp-data', 'wp-notices', 'wp-i18n' ], $script_version, true );
-    wp_localize_script(
-        'aco-promoter',
-        'acoPromoterData',
-        [
-            'can_create_resource' => current_user_can( 'create_resource' ),
-        ]
+    wp_enqueue_script(
+        $handle,
+        plugins_url('admin/promoter.js', __FILE__),
+        [ 'wp-api-fetch', 'wp-data', 'wp-notices', 'wp-i18n', 'wp-element', 'media-editor' ],
+        filemtime( $script_path ),
+        true
     );
-}
+
+    // Capability gate & optional debug flag (shows console.info).
+    wp_localize_script($handle, 'acoPromoterData', [
+        'can_create_resource' => current_user_can('create_resource') ? '1' : '0',
+        'debug'               => defined('WP_DEBUG') && WP_DEBUG,
+    ]);
+}, 20);
 
 /**
  * Register the REST endpoint for the "Promote to Resource" action.
@@ -2146,7 +2143,6 @@ add_action( 'admin_init', 'aco_re_handle_manual_tag_refresh' );
 add_action( 'plugins_loaded', 'aco_re_load_text_domain' );
 add_action( 'admin_menu', 'aco_re_register_settings_page' );
 add_action( 'admin_enqueue_scripts', 'aco_re_enqueue_linter_script' );
-add_action( 'admin_enqueue_scripts', 'aco_re_enqueue_promoter_script' );
 add_action( 'wp_dashboard_setup', 'aco_re_register_dashboard_widget' );
 add_action( 'aco_re_hourly_tag_sync_hook', 'aco_re_refresh_tag_allowlist' );
 add_action( 'rest_api_init', 'aco_re_register_webhook_endpoint' );
