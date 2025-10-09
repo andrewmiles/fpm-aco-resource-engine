@@ -88,6 +88,10 @@
     // This targets newly uploaded items appearing in the main library view.
     const newAttachments = select('core').getMediaItems({ per_page: 5, orderby: 'date', order: 'desc' }) || [];
 
+    // --- DEBUGGING LINE ---
+    console.log('Upload detector fired. Found attachments:', newAttachments.map(att => att.id));
+    // --- END DEBUGGING ---
+
     if (newAttachments.length > 0 && newAttachments !== previousAttachments) {
       const latestAttachment = newAttachments[0];
       const isAlreadyKnown = previousAttachments.some(att => att.id === latestAttachment.id);
