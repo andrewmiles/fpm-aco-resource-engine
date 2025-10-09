@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.19
+ * Version:         1.17.20
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1699,6 +1699,400 @@ function aco_re_clear_nightly_sync() {
 }
 
 
+// --- Promote to Resource (Editor UX) ---
+
+/**
+ * Enqueue the JavaScript for the "Promote to Resource" toast notification.
+ */
+function aco_re_enqueue_promoter_script() {
+    $screen = get_current_screen();
+    // Only load on screens where media uploads are likely.
+    if ( ! $screen || ! in_array( $screen->base, [ 'post', 'upload', 'media' ], true ) ) {
+        return;
+    }
+
+    $script_path = plugin_dir_path( __FILE__ ) . 'admin/promoter.js';
+    if ( ! file_exists( $script_path ) ) {
+        return;
+    }
+
+    $script_version = filemtime( $script_path );
+    $script_url     = plugins_url( 'admin/promoter.js', __FILE__ );
+    wp_enqueue_script( 'aco-promoter', $script_url, [ 'wp-api-fetch', 'wp-data', 'wp-notices', 'wp-i18n' ], $script_version, true );
+    wp_localize_script(
+        'aco-promoter',
+        'acoPromoterData',
+        [
+            'can_create_resource' => current_user_can( 'create_resource' ),
+        ]
+    );
+}
+
+/**
+ * Register the REST endpoint for the "Promote to Resource" action.
+ */
+function aco_re_register_promote_endpoint() {
+    register_rest_route(
+        'aco/v1',
+        '/promote',
+        [
+            'methods'             => 'POST',
+            'callback'            => 'aco_re_handle_promote_to_resource',
+            'permission_callback' => function () {
+                return current_user_can( 'create_resource' );
+            },
+            'args'                => [
+                'attachmentId' => [
+                    'required'          => true,
+                    'validate_callback' => function ( $param ) {
+                        return is_numeric( $param ) && $param > 0;
+                    },
+                    'sanitize_callback' => 'absint',
+                ],
+                'sourcePostId' => [
+                    'required'          => false,
+                    'validate_callback' => function ( $param ) {
+                        return is_numeric( $param ) && $param > 0;
+                    },
+                    'sanitize_callback' => 'absint',
+                ],
+                'summary'      => [
+                    'required'          => false,
+                    'sanitize_callback' => 'sanitize_textarea_field',
+                ],
+                'tags'         => [
+                    'required'          => false,
+                    'validate_callback' => function ( $param ) {
+                        return is_array( $param );
+                    },
+                ],
+            ],
+        ]
+    );
+}
+
+/**
+ * Handle the backend logic for promoting a media attachment to a canonical Resource.
+ */
+function aco_re_handle_promote_to_resource( WP_REST_Request $request ) {
+    $attachment_id  = (int) $request->get_param( 'attachmentId' );
+    $source_post_id = (int) $request->get_param( 'sourcePostId' );
+
+    $attachment = get_post( $attachment_id );
+    if ( ! $attachment || 'attachment' !== $attachment->post_type ) {
+        return new WP_Error(
+            'invalid_attachment',
+            __( 'The specified attachment does not exist.', 'fpm-aco-resource-engine' ),
+            [ 'status' => 404 ]
+        );
+    }
+
+    if ( ! current_user_can( 'edit_post', $attachment_id ) ) {
+        return new WP_Error(
+            'forbidden',
+            __( 'You cannot promote this attachment.', 'fpm-aco-resource-engine' ),
+            [ 'status' => 403 ]
+        );
+    }
+
+    $mime          = (string) get_post_mime_type( $attachment_id );
+    $allowed_mimes = (array) apply_filters( 'aco_re_allowed_mime_types', [ 'application/pdf' ] );
+    $mime_ok       = false;
+    foreach ( $allowed_mimes as $am ) {
+        if ( $mime && stripos( $mime, $am ) !== false ) {
+            $mime_ok = true;
+            break;
+        }
+    }
+    if ( ! $mime_ok ) {
+        return new WP_Error(
+            'bad_mime',
+            __( 'This file type cannot be promoted.', 'fpm-aco-resource-engine' ),
+            [ 'status' => 400 ]
+        );
+    }
+
+    $offload_info = aco_re_get_offload_info_with_retry( $attachment_id );
+    if ( ! $offload_info ) {
+        return new WP_Error(
+            'not_offloaded',
+            __( 'The attachment has not been offloaded yet. Please try again in a few seconds.', 'fpm-aco-resource-engine' ),
+            [ 'status' => 503 ]
+        );
+    }
+
+    $filesize = 0;
+    $filepath = get_attached_file( $attachment_id, true );
+    if ( $filepath && file_exists( $filepath ) ) {
+        $filesize = (int) filesize( $filepath );
+    }
+    if ( ! $filesize ) {
+        $meta = wp_get_attachment_metadata( $attachment_id );
+        if ( is_array( $meta ) && ! empty( $meta['filesize'] ) ) {
+            $filesize = (int) $meta['filesize'];
+        }
+    }
+    if ( ! $filesize ) {
+        return new WP_Error(
+            'no_filesize',
+            __( 'Could not determine file size for fingerprint.', 'fpm-aco-resource-engine' ),
+            [ 'status' => 500 ]
+        );
+    }
+
+    $fingerprint = sprintf(
+        's3:%s:%s|%d',
+        $offload_info['bucket'],
+        ltrim( (string) $offload_info['path'], '/' ),
+        $filesize
+    );
+
+    aco_re_log(
+        'info',
+        'Promote request received.',
+        [
+            'source'        => 'promote',
+            'attachment_id' => $attachment_id,
+            'mime'          => $mime,
+            'fingerprint'   => $fingerprint,
+            'action'        => 'promote_request',
+        ]
+    );
+
+    $existing = get_posts(
+        [
+            'post_type'      => 'resource',
+            'post_status'    => 'any',
+            'posts_per_page' => 1,
+            'meta_key'       => '_aco_file_fingerprint',
+            'meta_value'     => $fingerprint,
+            'fields'         => 'ids',
+            'no_found_rows'  => true,
+        ]
+    );
+
+    $resource_id = 0;
+    $action      = 'linked';
+
+    if ( ! empty( $existing ) ) {
+        $resource_id = (int) $existing[0];
+    } else {
+        $action             = 'created';
+        $new_resource_args  = [
+            'post_type'    => 'resource',
+            'post_title'   => wp_strip_all_tags( $attachment->post_title ?: 'New Resource' ),
+            'post_status'  => 'publish',
+            'post_excerpt' => (string) $request->get_param( 'summary' ) ?: $attachment->post_excerpt,
+        ];
+        $resource_id        = wp_insert_post( wp_slash( $new_resource_args ), true );
+        if ( is_wp_error( $resource_id ) ) {
+            aco_re_log(
+                'error',
+                'Promote create failed.',
+                [
+                    'source'        => 'promote',
+                    'attachment_id' => $attachment_id,
+                    'error'         => $resource_id->get_error_message(),
+                    'action'        => 'create',
+                ]
+            );
+            return $resource_id;
+        }
+
+        $tags = $request->get_param( 'tags' );
+        if ( is_array( $tags ) && ! empty( $tags ) ) {
+            $tag_names = array_map( 'sanitize_text_field', $tags );
+            _aco_re_set_post_terms_from_names(
+                (int) $resource_id,
+                'universal_tag',
+                $tag_names,
+                [
+                    'post_id' => (int) $resource_id,
+                    'source'  => 'promote',
+                ],
+                true
+            );
+        }
+    }
+
+    if ( ! $resource_id ) {
+        return new WP_Error(
+            'creation_failed',
+            __( 'Failed to create or link the resource.', 'fpm-aco-resource-engine' ),
+            [ 'status' => 500 ]
+        );
+    }
+
+    wp_update_post(
+        [
+            'ID'          => $attachment_id,
+            'post_parent' => $resource_id,
+        ]
+    );
+    update_post_meta( $resource_id, '_aco_primary_attachment_id', $attachment_id );
+    update_post_meta( $resource_id, '_aco_file_fingerprint', $fingerprint );
+
+    if ( $source_post_id > 0 && get_post_status( $source_post_id ) ) {
+        $file_url      = wp_get_attachment_url( $attachment_id );
+        $resource_link = get_permalink( $resource_id );
+        $content       = (string) get_post_field( 'post_content', $source_post_id );
+        if ( $file_url && $resource_link && $content && strpos( $content, $file_url ) !== false ) {
+            $updated = str_replace( $file_url, $resource_link, $content );
+            if ( $updated !== $content ) {
+                wp_update_post(
+                    [
+                        'ID'           => $source_post_id,
+                        'post_content' => $updated,
+                    ]
+                );
+            }
+        }
+    }
+
+    if ( function_exists( 'searchwp_reindex_post' ) ) {
+        searchwp_reindex_post( $resource_id );
+    }
+
+    if ( function_exists( 'as_enqueue_async_action' ) ) {
+        as_enqueue_async_action(
+            'aco_re_push_promoted_resource',
+            [
+                'resource_id'   => (int) $resource_id,
+                'attachment_id' => (int) $attachment_id,
+            ],
+            'aco_resource_sync'
+        );
+    }
+
+    aco_re_log(
+        'info',
+        'Promoted attachment to Resource.',
+        [
+            'source'        => 'promote',
+            'attachment_id' => $attachment_id,
+            'post_id'       => (int) $resource_id,
+            'action'        => $action,
+            'fingerprint'   => $fingerprint,
+        ]
+    );
+
+    return new WP_REST_Response(
+        [
+            'success'    => true,
+            'action'     => $action,
+            'resourceId' => (int) $resource_id,
+            'message'    => sprintf( __( 'Resource successfully %s.', 'fpm-aco-resource-engine' ), $action ),
+            'editLink'   => get_edit_post_link( $resource_id, 'raw' ),
+        ],
+        200
+    );
+}
+
+/**
+ * Worker for asynchronously pushing a newly promoted Resource to Airtable.
+ */
+add_action(
+    'aco_re_push_promoted_resource',
+    function ( $resource_id, $attachment_id ) {
+        $resource_id   = (int) $resource_id;
+        $attachment_id = (int) $attachment_id;
+
+        $api_key  = _aco_re_get_config( 'ACO_AT_API_KEY' );
+        $base_id  = _aco_re_get_config( 'ACO_AT_BASE_ID' );
+        $table_id = _aco_re_get_config( 'ACO_AT_TABLE_RESOURCES' );
+
+        if ( ! $api_key || ! $base_id || ! $table_id ) {
+            aco_re_log(
+                'warning',
+                'Airtable push skipped (missing creds).',
+                [
+                    'source'        => 'promote',
+                    'post_id'       => $resource_id,
+                    'attachment_id' => $attachment_id,
+                    'action'        => 'airtable_push_skip',
+                ]
+            );
+            return;
+        }
+
+        $file_url = wp_get_attachment_url( $attachment_id );
+        $title    = get_the_title( $resource_id );
+        $summary  = get_post_field( 'post_excerpt', $resource_id );
+
+        $payload = [
+            'fields' => [
+                'Title'   => (string) $title,
+                'Summary' => (string) $summary,
+                'FileURL' => (string) $file_url,
+            ],
+        ];
+
+        $res = wp_remote_post(
+            "https://api.airtable.com/v0/{$base_id}/{$table_id}",
+            [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $api_key,
+                    'Content-Type'  => 'application/json',
+                    'Accept'        => 'application/json',
+                ],
+                'timeout' => 20,
+                'body'    => wp_json_encode( $payload ),
+            ]
+        );
+
+        if ( is_wp_error( $res ) ) {
+            aco_re_log(
+                'warning',
+                'Airtable push failed (transport).',
+                [
+                    'source'        => 'promote',
+                    'post_id'       => $resource_id,
+                    'attachment_id' => $attachment_id,
+                    'action'        => 'airtable_push_fail',
+                    'error'         => $res->get_error_message(),
+                ]
+            );
+            return;
+        }
+
+        $code = (int) wp_remote_retrieve_response_code( $res );
+        $body = json_decode( (string) wp_remote_retrieve_body( $res ), true );
+        if ( 200 !== $code && 201 !== $code ) {
+            aco_re_log(
+                'warning',
+                'Airtable push failed (HTTP).',
+                [
+                    'source'        => 'promote',
+                    'post_id'       => $resource_id,
+                    'attachment_id' => $attachment_id,
+                    'action'        => 'airtable_push_fail',
+                    'error'         => 'HTTP ' . $code,
+                ]
+            );
+            return;
+        }
+
+        if ( isset( $body['id'] ) && is_string( $body['id'] ) ) {
+            update_post_meta( $resource_id, ACO_AT_RECORD_ID_META, $body['id'] );
+        }
+
+        aco_re_log(
+            'info',
+            'Airtable push OK.',
+            [
+                'source'        => 'promote',
+                'post_id'       => $resource_id,
+                'attachment_id' => $attachment_id,
+                'action'        => 'airtable_push_ok',
+                'record_id'     => isset( $body['id'] ) ? (string) $body['id'] : null,
+            ]
+        );
+    },
+    10,
+    2
+);
+
+
 // --- Hook Registrations ---
 
 // --- Activation / Deactivation / Uninstall Hooks ---
@@ -1707,19 +2101,29 @@ register_activation_hook( __FILE__, function () {
     aco_re_create_sync_log_table();
     if ( $admin_role = get_role( 'administrator' ) ) {
         $admin_role->add_cap( 'aco_manage_failover' );
+        $admin_role->add_cap( 'create_resource' );
+    }
+    if ( $editor_role = get_role( 'editor' ) ) {
+        $editor_role->add_cap( 'create_resource' );
     }
     add_option( 'aco_re_seed_terms_pending', true );
     if ( ! wp_next_scheduled( 'aco_re_hourly_tag_sync_hook' ) ) {
         wp_schedule_event( time(), 'hourly', 'aco_re_hourly_tag_sync_hook' );
     }
-    aco_re_schedule_nightly_sync(); // Add this line
+    aco_re_schedule_nightly_sync();
     aco_re_register_content_models();
     flush_rewrite_rules();
 } );
 
 register_deactivation_hook( __FILE__, function () {
+    if ( $admin_role = get_role( 'administrator' ) ) {
+        $admin_role->remove_cap( 'create_resource' );
+    }
+    if ( $editor_role = get_role( 'editor' ) ) {
+        $editor_role->remove_cap( 'create_resource' );
+    }
     wp_clear_scheduled_hook( 'aco_re_hourly_tag_sync_hook' );
-    aco_re_clear_nightly_sync(); // Add this line
+    aco_re_clear_nightly_sync();
     flush_rewrite_rules();
 } );
 
@@ -1742,9 +2146,11 @@ add_action( 'admin_init', 'aco_re_handle_manual_tag_refresh' );
 add_action( 'plugins_loaded', 'aco_re_load_text_domain' );
 add_action( 'admin_menu', 'aco_re_register_settings_page' );
 add_action( 'admin_enqueue_scripts', 'aco_re_enqueue_linter_script' );
+add_action( 'admin_enqueue_scripts', 'aco_re_enqueue_promoter_script' );
 add_action( 'wp_dashboard_setup', 'aco_re_register_dashboard_widget' );
 add_action( 'aco_re_hourly_tag_sync_hook', 'aco_re_refresh_tag_allowlist' );
 add_action( 'rest_api_init', 'aco_re_register_webhook_endpoint' );
+add_action( 'rest_api_init', 'aco_re_register_promote_endpoint' );
 add_action( 'aco_re_process_resource_sync', 'aco_re_process_resource_sync_action' );
 
 add_filter( 'rest_pre_insert_resource', 'aco_re_validate_tags_on_rest_save', 10, 2 );
