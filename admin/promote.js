@@ -10,18 +10,12 @@
     const snoozeKey = (postId, attachmentId) =>
       `aco-promote-snooze:${postId}:${attachmentId}`;
     const isSnoozed = (postId, attachmentId) => {
-      try {
-        return !!localStorage.getItem(snoozeKey(postId, attachmentId));
-      } catch (e) {
-        return false;
-      }
+      try { return !!localStorage.getItem(snoozeKey(postId, attachmentId)); }
+      catch (e) { return false; }
     };
     const snooze = (postId, attachmentId) => {
-      try {
-        localStorage.setItem(snoozeKey(postId, attachmentId), "1");
-      } catch (e) {
-        /* no-op if storage unavailable */
-      }
+      try { localStorage.setItem(snoozeKey(postId, attachmentId), "1"); }
+      catch (e) {}
     };
 
     function isPdfFileBlock(block) {
@@ -66,27 +60,22 @@
           });
           notices.createNotice("success", "Promoted to the Resource Library.", {
             isDismissible: true,
-            context: "aco-promote",
-            actions:
-              res && res.resourcePermalink
-                ? [{ label: "View Resource", url: res.resourcePermalink }]
-                : [],
+            actions: res && res.resourcePermalink
+              ? [{ label: "View Resource", url: res.resourcePermalink }]
+              : [],
           });
         } catch (e) {
           notices.createNotice(
             "error",
             "Could not promote this PDF. Please try again.",
-            {
-              isDismissible: true,
-              context: "aco-promote",
-            }
+            { isDismissible: true }
           );
         } finally {
           dispatch("core/notices").removeNotice(noticeId);
         }
       };
 
-      // Clear, non-jargony copy + reasons; “error” gives a light red background.
+      // Clear, non-jargony copy + reasons (amber background)
       const message = [
         "Add this PDF to the Resource Library?",
         "",
@@ -100,12 +89,11 @@
       ].join("\n");
 
       dispatch("core/notices").createNotice(
-        "warning", // amber background; change to 'error' for red
+        "warning",
         message,
         {
           id: noticeId,
           isDismissible: true, // closing (X) == Keep in this post
-          context: "aco-promote",
           speak: true,
           actions: [
             { label: "Promote to Resource", onClick: handlePromote },
