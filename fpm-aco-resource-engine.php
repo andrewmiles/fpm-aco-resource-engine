@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.18.6
+ * Version:         1.18.7
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -2437,13 +2437,18 @@ function aco_re_promote_controller(WP_REST_Request $request) {
         return new WP_Error('bad_attachment', __('Invalid attachment.', 'fpm-aco-resource-engine'), [ 'status' => 400 ]);
     }
     $mime = (string) get_post_mime_type($attachment_id);
-    if ('application/pdf' !== $mime) {
+    $file_url = (string) wp_get_attachment_url($attachment_id);
+    $looks_like_pdf = (bool) preg_match('/\.pdf(\?.*)?$/i', $file_url);
+    if ('application/pdf' !== $mime && ! $looks_like_pdf) {
         return new WP_Error('bad_mime', __('Only PDF files can be promoted.', 'fpm-aco-resource-engine'), [ 'status' => 400 ]);
     }
 
     // Require that the file is actually referenced in the post content.
-    $file_url = (string) wp_get_attachment_url($attachment_id);
-    if (!$file_url || false === strpos((string) $p->post_content, $file_url)) {
+    // Match either the exact file URL OR the block's JSON carrying the id ({"id":123}).
+    $content = (string) $p->post_content;
+    $has_url  = ($file_url && false !== strpos($content, $file_url));
+    $has_id   = (false !== strpos($content, '"id":' . $attachment_id)) || (false !== strpos($content, '"id": ' . $attachment_id));
+    if (!$has_url && !$has_id) {
         return new WP_Error('link_not_found', __('The file URL is not referenced in this post.', 'fpm-aco-resource-engine'), [ 'status' => 400 ]);
     }
 

@@ -70,11 +70,20 @@
                 : [],
           });
         } catch (e) {
-          notices.createNotice(
-            "error",
-            "Could not promote this PDF. Please try again.",
-            { isDismissible: true }
-          );
+          const apiMsg =
+            (e && e.message) ||
+            (e && e.data && e.data.message) ||
+            'Could not promote this file to the Resource Library, please try again';
+
+          console.error('ACO promote failed:', e);
+
+          notices.createNotice('error', apiMsg, {
+            isDismissible: true,
+            actions: [
+              // lets users immediately retry without re-uploading
+              { label: 'Try again', onClick: handlePromote }
+            ]
+          });
         } finally {
           dispatch("core/notices").removeNotice(noticeId);
         }
