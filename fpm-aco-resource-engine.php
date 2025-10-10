@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.18.5
+ * Version:         1.18.6
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -2277,12 +2277,10 @@ register_activation_hook(__FILE__, function () {
     if ($r = get_role('editor'))        { $r->add_cap('aco_promote_resource'); }
 });
 
+// Ensure roles always have the promote capability (idempotent, cheap).
 add_action('init', function () {
-    // Defensive grant in case roles were modified after activation.
-    if (is_admin() && current_user_can('manage_options')) {
-        if ($r = get_role('administrator')) { $r->add_cap('aco_promote_resource'); }
-        if ($r = get_role('editor'))        { $r->add_cap('aco_promote_resource'); }
-    }
+    if ($r = get_role('administrator')) { $r->add_cap('aco_promote_resource'); }
+    if ($r = get_role('editor'))        { $r->add_cap('aco_promote_resource'); }
 }, 1);
 
 function aco_re_current_user_can_promote(): bool {

@@ -10,12 +10,16 @@
     const snoozeKey = (postId, attachmentId) =>
       `aco-promote-snooze:${postId}:${attachmentId}`;
     const isSnoozed = (postId, attachmentId) => {
-      try { return !!localStorage.getItem(snoozeKey(postId, attachmentId)); }
-      catch (e) { return false; }
+      try {
+        return !!localStorage.getItem(snoozeKey(postId, attachmentId));
+      } catch (e) {
+        return false;
+      }
     };
     const snooze = (postId, attachmentId) => {
-      try { localStorage.setItem(snoozeKey(postId, attachmentId), "1"); }
-      catch (e) {}
+      try {
+        localStorage.setItem(snoozeKey(postId, attachmentId), "1");
+      } catch (e) {}
     };
 
     function isPdfFileBlock(block) {
@@ -60,9 +64,10 @@
           });
           notices.createNotice("success", "Promoted to the Resource Library.", {
             isDismissible: true,
-            actions: res && res.resourcePermalink
-              ? [{ label: "View Resource", url: res.resourcePermalink }]
-              : [],
+            actions:
+              res && res.resourcePermalink
+                ? [{ label: "View Resource", url: res.resourcePermalink }]
+                : [],
           });
         } catch (e) {
           notices.createNotice(
@@ -80,37 +85,33 @@
         "Add this PDF to the Resource Library?",
         "",
         "Promoting will:",
-        "• create a single library item with a stable link,",
-        "• make it easier to find in site search, and",
-        "• keep tags consistent using the approved list.",
+        "(1) create a single library item with a stable link,",
+        "(2) make it easier to find in site search, and",
+        "(3) keep tags consistent using the approved list.",
         "",
         "If this PDF is only relevant to this post, choose 'Keep in this post' or close this message.",
         "Choose 'Don't ask again' to hide this prompt for this PDF in this post.",
       ].join("\n");
 
-      dispatch("core/notices").createNotice(
-        "warning",
-        message,
-        {
-          id: noticeId,
-          isDismissible: true, // closing (X) == Keep in this post
-          speak: true,
-          actions: [
-            { label: "Promote to Resource", onClick: handlePromote },
-            {
-              label: "Keep in this post",
-              onClick: () => dispatch("core/notices").removeNotice(noticeId),
+      dispatch("core/notices").createNotice("warning", message, {
+        id: noticeId,
+        isDismissible: true, // closing (X) == Keep in this post
+        speak: true,
+        actions: [
+          { label: "Promote to Resource", onClick: handlePromote },
+          {
+            label: "Keep in this post",
+            onClick: () => dispatch("core/notices").removeNotice(noticeId),
+          },
+          {
+            label: "Don't ask again",
+            onClick: () => {
+              snooze(postId, attachmentId);
+              dispatch("core/notices").removeNotice(noticeId);
             },
-            {
-              label: "Don't ask again",
-              onClick: () => {
-                snooze(postId, attachmentId);
-                dispatch("core/notices").removeNotice(noticeId);
-              },
-            },
-          ],
-        }
-      );
+          },
+        ],
+      });
     });
   });
 })();
