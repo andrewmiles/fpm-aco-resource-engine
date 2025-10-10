@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.18.7
+ * Version:         1.18.8
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -2420,123 +2420,73 @@ function aco_re_promote_permission_callback(WP_REST_Request $request) {
     return true;
 }
 
-function aco_re_promote_controller(WP_REST_Request $request) {
-    $post_id        = (int) $request['postId'];
-    $attachment_id  = (int) $request['attachmentId'];
-    $tag_names      = array_values(array_filter(array_map('sanitize_text_field', (array) ($request['tags'] ?? []))));
-    $resource_type  = isset($request['resourceType']) ? sanitize_text_field((string) $request['resourceType']) : '';
+/**
+ * Does the post contain a core/file block with this attachment ID?
+ * - Recurses innerBlocks
+ * - Resolves reusable blocks (core/block → wp_block post via attrs.ref)
+ * - Depth limit + visited-set to avoid cycles
+ *
+ * @param WP_Post $post
+ * @param int     $attachment_id
+ * @return bool
+ */
+function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id ): bool {
+    $attachment_id = (int) $attachment_id;
+    if ( $attachment_id <= 0 ) { return false; }
 
-    $ctx = [ 'source' => 'promote', 'action' => 'promote', 'post_id' => $post_id, 'attachment_id' => $attachment_id ];
+    $content = (string) $post->post_content;
+    if ( $content === '' ) { return false; }
 
-    $p = get_post($post_id);
-    $a = get_post($attachment_id);
-    if (!$p || !in_array($p->post_type, aco_re_get_promote_allowed_source_types(), true)) {
-        return new WP_Error('bad_post', __('Invalid source post.', 'fpm-aco-resource-engine'), [ 'status' => 400 ]);
-    }
-    if (!$a || 'attachment' !== $a->post_type) {
-        return new WP_Error('bad_attachment', __('Invalid attachment.', 'fpm-aco-resource-engine'), [ 'status' => 400 ]);
-    }
-    $mime = (string) get_post_mime_type($attachment_id);
-    $file_url = (string) wp_get_attachment_url($attachment_id);
-    $looks_like_pdf = (bool) preg_match('/\.pdf(\?.*)?$/i', $file_url);
-    if ('application/pdf' !== $mime && ! $looks_like_pdf) {
-        return new WP_Error('bad_mime', __('Only PDF files can be promoted.', 'fpm-aco-resource-engine'), [ 'status' => 400 ]);
-    }
+    $blocks = parse_blocks( $content );
+    if ( ! is_array( $blocks ) ) { return false; }
 
-    // Require that the file is actually referenced in the post content.
-    // Match either the exact file URL OR the block's JSON carrying the id ({"id":123}).
-    $content = (string) $p->post_content;
-    $has_url  = ($file_url && false !== strpos($content, $file_url));
-    $has_id   = (false !== strpos($content, '"id":' . $attachment_id)) || (false !== strpos($content, '"id": ' . $attachment_id));
-    if (!$has_url && !$has_id) {
-        return new WP_Error('link_not_found', __('The file URL is not referenced in this post.', 'fpm-aco-resource-engine'), [ 'status' => 400 ]);
-    }
+    $max_depth = 10;
+    $visited_reusable = []; // [ wp_block_post_id => true ]
 
-    // Transient lock to reduce races (30s).
-    $lock_key = 'aco_re_promote_lock_' . $attachment_id;
-    if (get_transient($lock_key)) {
-        return new WP_Error('busy', __('This file is being promoted by another process. Please try again.', 'fpm-aco-resource-engine'), [ 'status' => 409 ]);
-    }
-    set_transient($lock_key, 1, 30);
+    $walker = static function ( array $list, int $depth ) use ( &$walker, $attachment_id, $max_depth, &$visited_reusable ): bool {
+        if ( $depth > $max_depth ) { return false; }
 
-    try {
-        // Fingerprint
-        $fingerprint = _aco_re_compute_attachment_fingerprint($attachment_id);
+        foreach ( $list as $b ) {
+            $name = isset( $b['blockName'] ) ? (string) $b['blockName'] : '';
 
-        // Find or create the Resource
-        $resource_id = 0;
-        if ($fingerprint) {
-            $q = new WP_Query([
-                'post_type'      => 'resource',
-                'posts_per_page' => 1,
-                'post_status'    => [ 'publish', 'private' ],
-                'meta_key'       => '_aco_file_fingerprint',
-                'meta_value'     => $fingerprint,
-                'fields'         => 'ids',
-                'no_found_rows'  => true,
-            ]);
-            if ($q->have_posts()) {
-                $resource_id = (int) $q->posts[0];
+            // Direct core/file match
+            if ( $name === 'core/file' ) {
+                $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
+                $id    = isset( $attrs['id'] ) ? (int) $attrs['id'] : 0;
+                if ( $id === $attachment_id ) {
+                    return true;
+                }
+            }
+
+            // Reusable block: core/block → attrs.ref (post type: wp_block)
+            if ( $name === 'core/block' ) {
+                $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
+                $ref   = isset( $attrs['ref'] ) ? (int) $attrs['ref'] : 0;
+                if ( $ref > 0 && empty( $visited_reusable[ $ref ] ) ) {
+                    $visited_reusable[ $ref ] = true;
+                    $ref_post = get_post( $ref );
+                    if ( $ref_post instanceof WP_Post && $ref_post->post_type === 'wp_block' ) {
+                        $ref_blocks = parse_blocks( (string) $ref_post->post_content );
+                        if ( is_array( $ref_blocks ) && $walker( $ref_blocks, $depth + 1 ) ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Recurse inner blocks
+            if ( ! empty( $b['innerBlocks'] ) && is_array( $b['innerBlocks'] ) ) {
+                if ( $walker( $b['innerBlocks'], $depth + 1 ) ) {
+                    return true;
+                }
             }
         }
+        return false;
+    };
 
-        if (!$resource_id) {
-            $title = get_the_title($attachment_id) ?: basename((string) $file_url);
-            $resource_id = wp_insert_post([
-                'post_type'   => 'resource',
-                'post_status' => 'publish',
-                'post_title'  => wp_strip_all_tags($title),
-                'post_content'=> '',
-            ], true);
-            if (is_wp_error($resource_id)) {
-                return $resource_id;
-            }
-            if ($fingerprint) {
-                update_post_meta($resource_id, '_aco_file_fingerprint', $fingerprint);
-            }
-        }
-
-        // Link attachment to Resource and store meta
-        wp_update_post([ 'ID' => $attachment_id, 'post_parent' => $resource_id ]);
-        update_post_meta($resource_id, '_aco_primary_attachment_id', $attachment_id);
-
-        // Terms
-        $log_ctx = $ctx + [ 'resource_id' => (int) $resource_id ];
-        if ($resource_type !== '' && function_exists('_aco_re_set_post_terms_from_names')) {
-            _aco_re_set_post_terms_from_names($resource_id, 'resource_type', [ $resource_type ], $log_ctx, false);
-        }
-        if (!empty($tag_names) && function_exists('_aco_re_set_post_terms_from_names')) {
-            _aco_re_set_post_terms_from_names($resource_id, 'universal_tag', $tag_names, $log_ctx, true);
-        }
-
-        // Rewrite in the source post (slash for safety)
-        $resource_link = get_permalink($resource_id);
-        if ($resource_link) {
-            $content = (string) str_replace($file_url, $resource_link, (string) $p->post_content);
-            wp_update_post(wp_slash([ 'ID' => $p->ID, 'post_content' => $content ]));
-        }
-
-        // Airtable (best-effort)
-        _aco_re_airtable_post_fileurl($file_url);
-
-        // Optional SearchWP single-item reindex
-        if (function_exists('searchwp') && method_exists(searchwp()->indexer(), 'queue')) {
-            try { searchwp()->indexer()->queue('post', (int) $resource_id); } catch (\Throwable $e) {}
-        }
-        do_action('aco_re_after_promote', (int) $resource_id);
-
-        if (function_exists('aco_re_log')) {
-            aco_re_log('info', 'Promoted PDF to Resource.', $log_ctx);
-        }
-
-        return new WP_REST_Response([
-            'resourceId'        => (int) $resource_id,
-            'resourcePermalink' => (string) $resource_link,
-        ], 200);
-
-    } finally {
-        delete_transient($lock_key);
-    }
+    return $walker( $blocks, 0 );
 }
+
+// (removed legacy controller — superseded by the block-aware implementation below)
 
 // -- END: ACO Promote-to-Resource (v1) --
