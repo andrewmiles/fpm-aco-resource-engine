@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.18.9
+ * Version:         1.18.10
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -2507,57 +2507,73 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
     $content = (string) $post->post_content;
     if ( $content === '' ) { return false; }
 
+    // Candidates + canonical filename (host/CDN agnostic)
+    $file_url = wp_get_attachment_url( $attachment_id );
+    $page_url = get_attachment_link( $attachment_id );
+    $basename = '';
+    if ( $file_url ) {
+        $p = wp_parse_url( $file_url, PHP_URL_PATH );
+        if ( is_string( $p ) ) { $basename = basename( $p ); }
+    }
+    if ( $basename === '' ) {
+        $local = get_attached_file( $attachment_id );
+        if ( $local && file_exists( $local ) ) { $basename = basename( $local ); }
+    }
+
     $blocks = parse_blocks( $content );
-    if ( ! is_array( $blocks ) ) { return false; }
+    if ( is_array( $blocks ) ) {
+        $max_depth = 10;
+        $visited_reusable = [];
 
-    $max_depth = 10;
-    $visited_reusable = []; // [ wp_block_post_id => true ]
+        $walker = static function ( array $list, int $depth ) use ( &$walker, $attachment_id, $basename, $max_depth, &$visited_reusable ): bool {
+            if ( $depth > $max_depth ) { return false; }
+            foreach ( $list as $b ) {
+                $name = isset( $b['blockName'] ) ? (string) $b['blockName'] : '';
 
-    $walker = static function ( array $list, int $depth ) use ( &$walker, $attachment_id, $max_depth, &$visited_reusable ): bool {
-        if ( $depth > $max_depth ) { return false; }
+                if ( $name === 'core/file' ) {
+                    $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
+                    $id    = isset( $attrs['id'] ) ? (int) $attrs['id'] : 0;
+                    if ( $id === $attachment_id ) { return true; }
 
-        foreach ( $list as $b ) {
-            $name = isset( $b['blockName'] ) ? (string) $b['blockName'] : '';
-
-            // Direct core/file match
-            if ( $name === 'core/file' ) {
-                $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
-                $id    = isset( $attrs['id'] ) ? (int) $attrs['id'] : 0;
-                if ( $id === $attachment_id ) {
-                    return true;
+                    // Accept href that ends with the same filename (handles host/CDN swaps)
+                    if ( $basename !== '' && ! empty( $attrs['href'] ) ) {
+                        $path = (string) wp_parse_url( (string) $attrs['href'], PHP_URL_PATH );
+                        if ( $path && substr( $path, -strlen( $basename ) ) === $basename ) { return true; }
+                    }
                 }
-            }
 
-            // Reusable block: core/block → attrs.ref (post type: wp_block)
-            if ( $name === 'core/block' ) {
-                $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
-                $ref   = isset( $attrs['ref'] ) ? (int) $attrs['ref'] : 0;
-                if ( $ref > 0 && empty( $visited_reusable[ $ref ] ) ) {
-                    $visited_reusable[ $ref ] = true;
-                    $ref_post = get_post( $ref );
-                    if ( $ref_post instanceof WP_Post && $ref_post->post_type === 'wp_block' ) {
-                        $ref_blocks = parse_blocks( (string) $ref_post->post_content );
-                        if ( is_array( $ref_blocks ) && $walker( $ref_blocks, $depth + 1 ) ) {
-                            return true;
+                if ( $name === 'core/block' ) {
+                    $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
+                    $ref   = isset( $attrs['ref'] ) ? (int) $attrs['ref'] : 0;
+                    if ( $ref > 0 && empty( $visited_reusable[ $ref ] ) ) {
+                        $visited_reusable[ $ref ] = true;
+                        $ref_post = get_post( $ref );
+                        if ( $ref_post instanceof WP_Post && $ref_post->post_type === 'wp_block' ) {
+                            $ref_blocks = parse_blocks( (string) $ref_post->post_content );
+                            if ( is_array( $ref_blocks ) && $walker( $ref_blocks, $depth + 1 ) ) { return true; }
                         }
                     }
                 }
-            }
 
-            // Recurse inner blocks
-            if ( ! empty( $b['innerBlocks'] ) && is_array( $b['innerBlocks'] ) ) {
-                if ( $walker( $b['innerBlocks'], $depth + 1 ) ) {
-                    return true;
+                if ( ! empty( $b['innerBlocks'] ) && is_array( $b['innerBlocks'] ) ) {
+                    if ( $walker( $b['innerBlocks'], $depth + 1 ) ) { return true; }
                 }
             }
-        }
-        return false;
-    };
+            return false;
+        };
 
-    return $walker( $blocks, 0 );
+        if ( $walker( $blocks, 0 ) ) { return true; }
+    }
+
+    // Raw-content fallbacks (exact URL, attachment page URL, or filename match)
+    if ( $file_url && strpos( $content, $file_url ) !== false ) { return true; }
+    if ( $page_url && strpos( $content, $page_url ) !== false ) { return true; }
+    if ( $basename !== '' && preg_match( '#href=["\'][^"\']*' . preg_quote( $basename, '#' ) . '["\']#i', $content ) ) { return true; }
+
+    return false;
 }
 
-// (removed legacy controller — superseded by the block-aware implementation below)
+
 
 /**
  * Controller: POST /aco/v1/promote
