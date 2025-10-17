@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.19.4
+ * Version:         1.19.6
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -2813,13 +2813,13 @@ if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
     if ( is_string( $resource_link ) && $resource_link !== '' ) {
         $updated_content = $content;
 
-        // Targets we know about: direct file URL and the attachment page URL.
+        // Known direct targets we can replace 1:1
         $targets = array_filter( [
             $file_url,
             get_attachment_link( $attachment_id ),
         ] );
 
-        // Also capture any hrefs in the content that reference ?attachment_id=<ID>
+        // Also capture any hrefs with ?attachment_id=<ID>
         if ( preg_match_all(
             '#href=["\']([^"\']*?(?:\?|&)attachment_id=' . preg_quote( (string) $attachment_id, '#' ) . '\b[^"\']*)["\']#i',
             $content,
@@ -2830,25 +2830,49 @@ if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
             }
         }
 
-        // Deduplicate targets and perform replacements.
+        // 1) Exact known URLs → resource permalink
         $targets = array_values( array_unique( array_filter( $targets ) ) );
         foreach ( $targets as $t ) {
             $updated_content = str_replace( $t, $resource_link, $updated_content );
         }
 
+        // Compute path + filename for path/filename based rewrites
+        $file_path = (string) wp_parse_url( $file_url, PHP_URL_PATH );
+        $basename  = $file_path ? basename( $file_path ) : '';
+
+        // Build an encoded variant of the path (to match blocks that URL-encode the href)
+        $encoded_path = '';
+        if ( $file_path ) {
+            $segments     = array_map( 'rawurlencode', array_filter( explode( '/', ltrim( $file_path, '/' ) ) ) );
+            $encoded_path = '/' . implode( '/', $segments );
+        }
+
+        // 2) Path-based replace (host-agnostic, keeps existing quotes)
+        if ( $file_path ) {
+            $pattern_by_path = '#href=(["\'])([^"\']*' . preg_quote( $file_path, '#' ) . '(?:[?#][^"\']*)?)\1#i';
+            $updated_content = preg_replace( $pattern_by_path, 'href=$1' . esc_url( $resource_link ) . '$1', $updated_content ) ?? $updated_content;
+        }
+        if ( $encoded_path && $encoded_path !== $file_path ) {
+            $pattern_by_enc_path = '#href=(["\'])([^"\']*' . preg_quote( $encoded_path, '#' ) . '(?:[?#][^"\']*)?)\1#i';
+            $updated_content     = preg_replace( $pattern_by_enc_path, 'href=$1' . esc_url( $resource_link ) . '$1', $updated_content ) ?? $updated_content;
+        }
+
+        // 3) Filename fallback (handles CDN domain swaps & transformed prefixes)
+        if ( $basename ) {
+            $pattern_by_name = '#href=(["\'])([^"\']*/' . preg_quote( $basename, '#' ) . '(?:[?#][^"\']*)?)\1#i';
+            $updated_content = preg_replace( $pattern_by_name, 'href=$1' . esc_url( $resource_link ) . '$1', $updated_content ) ?? $updated_content;
+        }
+
         if ( $updated_content !== $content ) {
             $u = wp_update_post( [ 'ID' => $post_id, 'post_content' => $updated_content ], true );
-            if ( is_wp_error( $u ) ) {
-                // non-fatal
-                if ( function_exists( 'aco_re_log' ) ) {
-                    aco_re_log( 'warning', 'Content rewrite failed.', [
-                        'source'        => 'promote',
-                        'action'        => 'rewrite',
-                        'post_id'       => $post_id,
-                        'attachment_id' => $attachment_id,
-                        'error'         => $u->get_error_message(),
-                    ] );
-                }
+            if ( is_wp_error( $u ) && function_exists( 'aco_re_log' ) ) {
+                aco_re_log( 'warning', 'Content rewrite failed.', [
+                    'source'        => 'promote',
+                    'action'        => 'rewrite',
+                    'post_id'       => $post_id,
+                    'attachment_id' => $attachment_id,
+                    'error'         => $u->get_error_message(),
+                ] );
             }
         }
     }
@@ -2921,6 +2945,25 @@ if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
 }
 
 // -- END: ACO Promote-to-Resource (v1) --
+
+if ( ! function_exists( 'aco_re_single_resource_template' ) ) {
+    /**
+     * Provide a default single template for the Resource post type when the theme does not supply one.
+     *
+     * @param string $single The path to the template WordPress intends to use.
+     * @return string
+     */
+    function aco_re_single_resource_template( $single ) {
+        if ( is_singular( 'resource' ) ) {
+            $template = plugin_dir_path( __FILE__ ) . 'templates/single-resource.php';
+            if ( file_exists( $template ) ) {
+                return $template;
+            }
+        }
+        return $single;
+    }
+}
+add_filter( 'single_template', 'aco_re_single_resource_template' );
 
 // --- SearchWP Integration ---
 
