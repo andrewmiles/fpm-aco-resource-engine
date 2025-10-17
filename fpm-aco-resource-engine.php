@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.18.10
+ * Version:         1.19.1
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1171,6 +1171,26 @@ function _aco_re_sideload_and_attach_file( int $post_id, string $file_url ) {
 
     update_post_meta( $post_id, '_aco_primary_attachment_id', $attachment_id );
 
+    // START: Patch to parent the attachment and trigger re-index
+    $parent_result = wp_update_post(
+        [ 'ID' => (int) $attachment_id, 'post_parent' => (int) $post_id ],
+        true
+    );
+    if ( is_wp_error( $parent_result ) ) {
+        aco_re_log('warning', 'Could not parent attachment to Resource.', [
+            'post_id'       => (int) $post_id,
+            'attachment_id' => (int) $attachment_id,
+            'action'        => 'file_parent',
+            'error'         => $parent_result->get_error_message(),
+        ]);
+    } else {
+        // If SearchWP is present, enqueue a reindex of the Resource so PDF content attribution updates.
+        if ( has_action( 'searchwp\\index\\enqueue' ) ) {
+            do_action( 'searchwp\\index\\enqueue', 'post', (int) $post_id );
+        }
+    }
+    // END: Patch
+
     // 4) Compute fingerprint (with small retry for Offload row)
     $off = aco_re_get_offload_info_with_retry( $attachment_id );
     if ( ! $off ) {
@@ -1368,6 +1388,11 @@ function aco_re_process_resource_sync_action( $payload ) {
             }
         }
         
+        // --- Enqueue SearchWP reindex on successful upsert ---
+        if ( has_action( 'searchwp\\index\\enqueue' ) && $post_id ) {
+            do_action( 'searchwp\\index\\enqueue', 'post', (int) $post_id );
+        }
+
         // --- LOG FINAL STATUS ---
         if ( $action === 'create' ) {
             aco_re_log( 'info', 'ACCEPTED CREATE.', [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'action' => 'create' ] );
@@ -2765,3 +2790,59 @@ function aco_re_promote_controller( WP_REST_Request $request ) {
 }
 
 // -- END: ACO Promote-to-Resource (v1) --
+
+// --- SearchWP Integration ---
+
+/**
+ * Hardened helper to get the current search scope from the request.
+ *
+ * @return string The validated scope, defaulting to 'all'.
+ */
+function aco_re_get_search_scope_from_request(): string {
+    $scope   = isset( $_GET['scope'] ) ? sanitize_key( (string) $_GET['scope'] ) : '';
+    $allowed = (array) apply_filters( 'aco_re_allowed_search_scopes', [ 'all', 'resources', 'news' ] );
+    return in_array( $scope, $allowed, true ) ? $scope : 'all';
+}
+
+/**
+ * Modifies the main WordPress query based on the 'scope' GET parameter for the global search.
+ * This version uses an allowlist and a filterable map for post types.
+ *
+ * @param WP_Query $query The main WP_Query object.
+ */
+function aco_re_modify_query_for_scope_selector( WP_Query $query ): void {
+    if ( is_admin() || ! $query->is_main_query() || ! $query->is_search() ) {
+        return;
+    }
+
+    $scope = aco_re_get_search_scope_from_request();
+
+    // Map each scope to the post types we want to include. Filterable for future extension.
+    $map = (array) apply_filters( 'aco_re_scope_to_post_types', [
+        'all'       => [ 'post', 'resource' ],
+        'resources' => [ 'resource' ],
+        'news'      => [ 'post' ],
+    ] );
+
+    if ( isset( $map[ $scope ] ) && is_array( $map[ $scope ] ) ) {
+        $query->set( 'post_type', array_values( array_unique( array_map( 'sanitize_key', $map[ $scope ] ) ) ) );
+    }
+}
+add_action( 'pre_get_posts', 'aco_re_modify_query_for_scope_selector' );
+
+/**
+ * Feature-flagged stub for the programmatic SearchWP engine registration.
+ * DO NOT enable this until the programmatic API for SearchWP v4 has been fully validated.
+ *
+ * @param array $engines The existing array of SearchWP engines.
+ * @return array The modified array of engines.
+ */
+function aco_re_register_searchwp_engine_placeholder( $engines ) {
+    if ( ! apply_filters( 'aco_re_enable_searchwp_resources_engine', false ) ) {
+        return $engines;
+    }
+    // Intentionally left blank pending API validation.
+    // When ready, the code to define the 'resources' engine will go here.
+    return $engines;
+}
+add_filter( 'searchwp\engines', 'aco_re_register_searchwp_engine_placeholder', 0 );
