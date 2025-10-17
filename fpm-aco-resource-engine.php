@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.19.1
+ * Version:         1.19.4
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -938,7 +938,8 @@ function aco_re_log( string $level, string $message, array $context = [] ): void
         'record_id'     => isset( $context['record_id'] ) ? (string) $context['record_id'] : null,
         'last_modified' => isset( $context['raw_last_modified'] ) ? (string) $context['raw_last_modified'] : null,
         'action'        => isset( $context['action'] ) ? (string) $context['action'] : null,
-        'resource_id'   => isset( $context['post_id'] ) ? (int) $context['post_id'] : null,
+        'resource_id'   => isset( $context['resource_id'] ) ? (int) $context['resource_id']
+                    : ( isset( $context['post_id'] ) ? (int) $context['post_id'] : null ),
         'attachment_id' => isset( $context['attachment_id'] ) ? (int) $context['attachment_id'] : null,
         'fingerprint'   => isset( $context['fingerprint'] ) ? substr( (string) $context['fingerprint'], 0, 255 ) : null,
         'status'        => $status,
@@ -2517,9 +2518,16 @@ function aco_re_promote_permission_callback(WP_REST_Request $request) {
 
 /**
  * Does the post contain a core/file block with this attachment ID?
+ * 
+ * Filter: aco_re_promote_block_walk_max_depth
+ * Adjust the maximum recursion depth when scanning blocks for a core/file link.
+ * Default 10. Return an integer >= 1.
+ *
  * - Recurses innerBlocks
  * - Resolves reusable blocks (core/block → wp_block post via attrs.ref)
- * - Depth limit + visited-set to avoid cycles
+ * - Depth limit (filterable) + visited-set to avoid cycles
+ * - Compares URL *paths* scheme/host-agnostically (now with rawurldecode())
+ * - Accepts ?attachment_id=<id> form and basename suffix as last resort
  *
  * @param WP_Post $post
  * @param int     $attachment_id
@@ -2535,6 +2543,7 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
     // Candidates + canonical filename (host/CDN agnostic)
     $file_url = wp_get_attachment_url( $attachment_id );
     $page_url = get_attachment_link( $attachment_id );
+
     $basename = '';
     if ( $file_url ) {
         $p = wp_parse_url( $file_url, PHP_URL_PATH );
@@ -2545,12 +2554,32 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
         if ( $local && file_exists( $local ) ) { $basename = basename( $local ); }
     }
 
+    // Helpers: scheme/host agnostic comparison + attachment_id detector
+    $same_path = static function( string $a, string $b ): bool {
+        if ( $a === '' || $b === '' ) { return false; }
+        $pa = wp_parse_url( $a ); $pb = wp_parse_url( $b );
+        $path_a = isset( $pa['path'] ) ? rtrim( rawurldecode( $pa['path'] ), '/' ) : '';
+        $path_b = isset( $pb['path'] ) ? rtrim( rawurldecode( $pb['path'] ), '/' ) : '';
+        return $path_a !== '' && $path_a === $path_b;
+    };
+    $href_points_to_attachment = static function( string $href ) use ( $attachment_id ): bool {
+        if ( $href === '' ) { return false; }
+        $parts = wp_parse_url( $href );
+        if ( empty( $parts['query'] ) ) { return false; }
+        parse_str( $parts['query'], $q );
+        return isset( $q['attachment_id'] ) && (int) $q['attachment_id'] === $attachment_id;
+    };
+
     $blocks = parse_blocks( $content );
     if ( is_array( $blocks ) ) {
-        $max_depth = 10;
+        /** Allow integrators to reduce/increase traversal depth (default 10). */
+        $max_depth = (int) apply_filters( 'aco_re_promote_block_walk_max_depth', 10 );
         $visited_reusable = [];
 
-        $walker = static function ( array $list, int $depth ) use ( &$walker, $attachment_id, $basename, $max_depth, &$visited_reusable ): bool {
+        $walker = static function ( array $list, int $depth ) use (
+            &$walker, $attachment_id, $file_url, $page_url, $basename, $max_depth, &$visited_reusable,
+            $same_path, $href_points_to_attachment
+        ): bool {
             if ( $depth > $max_depth ) { return false; }
             foreach ( $list as $b ) {
                 $name = isset( $b['blockName'] ) ? (string) $b['blockName'] : '';
@@ -2560,10 +2589,20 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
                     $id    = isset( $attrs['id'] ) ? (int) $attrs['id'] : 0;
                     if ( $id === $attachment_id ) { return true; }
 
-                    // Accept href that ends with the same filename (handles host/CDN swaps)
-                    if ( $basename !== '' && ! empty( $attrs['href'] ) ) {
-                        $path = (string) wp_parse_url( (string) $attrs['href'], PHP_URL_PATH );
-                        if ( $path && substr( $path, -strlen( $basename ) ) === $basename ) { return true; }
+                    $href = isset( $attrs['href'] ) ? (string) $attrs['href'] : '';
+                    if ( $href !== '' ) {
+                        // 1) Exact path equality with file URL or attachment page URL (scheme/host agnostic)
+                        if ( $file_url && $same_path( $href, $file_url ) ) { return true; }
+                        if ( $page_url && $same_path( $href, $page_url ) ) { return true; }
+
+                        // 2) attachment_id query param (e.g. /?attachment_id=123)
+                        if ( $href_points_to_attachment( $href ) ) { return true; }
+
+                        // 3) Last-resort: filename suffix for CDN/host swaps
+                        if ( $basename !== '' ) {
+                            $path = (string) wp_parse_url( $href, PHP_URL_PATH );
+                            if ( $path && substr( $path, -strlen( $basename ) ) === $basename ) { return true; }
+                        }
                     }
                 }
 
@@ -2590,9 +2629,10 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
         if ( $walker( $blocks, 0 ) ) { return true; }
     }
 
-    // Raw-content fallbacks (exact URL, attachment page URL, or filename match)
+    // Raw-content fallbacks (exact URL, attachment page URL, or filename / attachment_id param)
     if ( $file_url && strpos( $content, $file_url ) !== false ) { return true; }
     if ( $page_url && strpos( $content, $page_url ) !== false ) { return true; }
+    if ( $attachment_id && preg_match( '#(?:\?|&)(?:attachment_id)=' . preg_quote( (string) $attachment_id, '#' ) . '\b#', $content ) ) { return true; }
     if ( $basename !== '' && preg_match( '#href=["\'][^"\']*' . preg_quote( $basename, '#' ) . '["\']#i', $content ) ) { return true; }
 
     return false;
@@ -2644,26 +2684,59 @@ function aco_re_promote_controller( WP_REST_Request $request ) {
         return new WP_Error( 'file_url_missing', __( 'Could not resolve the attachment URL.', 'fpm-aco-resource-engine' ), [ 'status' => 500 ] );
     }
 
-    // ---- Verify link presence (block-aware with URL fallback) ----
-    $content   = (string) $post->post_content;
-    $has_block = aco_re_post_has_file_block_with_id( $post, $attachment_id );
-    $has_url   = ( $file_url && strpos( $content, $file_url ) !== false );
+// ---- Verify link presence (block-aware with broader fallbacks) ----
+$content   = (string) $post->post_content;
+$has_block = aco_re_post_has_file_block_with_id( $post, $attachment_id );
+$has_url   = ( $file_url && strpos( $content, $file_url ) !== false );
 
-    if ( ! $has_block && ! $has_url ) {
-        if ( function_exists( 'aco_re_log' ) ) {
-            aco_re_log( 'warning', 'Promote failed: file link not found in post content', [
-                'source'        => 'promote',
-                'action'        => 'link_check',
-                'post_id'       => $post_id,
-                'attachment_id' => $attachment_id,
-            ] );
-        }
-        return new WP_Error(
-            'link_not_found',
-            __( 'The selected PDF is not present as a File block in this post.', 'fpm-aco-resource-engine' ),
-            [ 'status' => 400, 'postId' => $post_id, 'attachmentId' => $attachment_id ]
-        );
+// Attachment page URL present?
+$page_url  = get_attachment_link( $attachment_id );
+$has_page  = ( $page_url && strpos( $content, $page_url ) !== false );
+
+// Any link using ?attachment_id=<ID> ?
+$has_qs    = (bool) preg_match(
+    '#href=["\'][^"\']*(?:\?|&)attachment_id=' . preg_quote( (string) $attachment_id, '#' ) . '\b[^"\']*["\']#i',
+    $content
+);
+
+// Any link whose href ends with the file's basename (plain or URL-encoded)?
+$basename      = '';
+$basename_enc  = '';
+$path_from_url = wp_parse_url( (string) $file_url, PHP_URL_PATH );
+if ( is_string( $path_from_url ) && $path_from_url !== '' ) {
+    $basename     = basename( rawurldecode( $path_from_url ) );
+    $basename_enc = rawurlencode( $basename );
+}
+if ( $basename === '' ) {
+    $local = get_attached_file( $attachment_id );
+    if ( $local && file_exists( $local ) ) {
+        $basename     = basename( $local );
+        $basename_enc = rawurlencode( $basename );
     }
+}
+$has_basename = false;
+if ( $basename !== '' ) {
+    $has_basename = (bool) preg_match(
+        '#href=["\'][^"\']*(?:' . preg_quote( $basename, '#' ) . '|' . preg_quote( $basename_enc, '#' ) . ')[^"\']*["\']#i',
+        $content
+    );
+}
+
+if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
+    if ( function_exists( 'aco_re_log' ) ) {
+        aco_re_log( 'warning', 'Promote failed: file link not found in post content', [
+            'source'        => 'promote',
+            'action'        => 'link_check',
+            'post_id'       => $post_id,
+            'attachment_id' => $attachment_id,
+        ] );
+    }
+    return new WP_Error(
+        'link_not_found',
+        __( 'The selected PDF is not present as a File block in this post.', 'fpm-aco-resource-engine' ),
+        [ 'status' => 400, 'postId' => $post_id, 'attachmentId' => $attachment_id ]
+    );
+}
 
     // ---- Create or reuse Resource by fingerprint ----
     $fingerprint = (string) _aco_re_compute_attachment_fingerprint( $attachment_id );
@@ -2709,6 +2782,10 @@ function aco_re_promote_controller( WP_REST_Request $request ) {
         }
     }
 
+    // BEFORE re-parenting, capture whether the attachment belonged to the source post
+    $att = $att instanceof WP_Post ? $att : get_post( $attachment_id );
+    $was_parented_to_source = ( $att instanceof WP_Post ) ? ( (int) $att->post_parent === $post_id ) : false;
+
     // ---- Parent the attachment to the resource ----
     $parented = wp_update_post( [ 'ID' => $attachment_id, 'post_parent' => $resource_id ], true );
     if ( is_wp_error( $parented ) ) {
@@ -2731,10 +2808,34 @@ function aco_re_promote_controller( WP_REST_Request $request ) {
         }
     }
 
-    // ---- Rewrite the post content link (best-effort) ----
+    // ---- Rewrite the post content link (best-effort; broadened) ----
     $resource_link = get_permalink( $resource_id );
     if ( is_string( $resource_link ) && $resource_link !== '' ) {
-        $updated_content = str_replace( $file_url, $resource_link, $content );
+        $updated_content = $content;
+
+        // Targets we know about: direct file URL and the attachment page URL.
+        $targets = array_filter( [
+            $file_url,
+            get_attachment_link( $attachment_id ),
+        ] );
+
+        // Also capture any hrefs in the content that reference ?attachment_id=<ID>
+        if ( preg_match_all(
+            '#href=["\']([^"\']*?(?:\?|&)attachment_id=' . preg_quote( (string) $attachment_id, '#' ) . '\b[^"\']*)["\']#i',
+            $content,
+            $m
+        ) ) {
+            foreach ( array_unique( (array) $m[1] ) as $href ) {
+                $targets[] = $href;
+            }
+        }
+
+        // Deduplicate targets and perform replacements.
+        $targets = array_values( array_unique( array_filter( $targets ) ) );
+        foreach ( $targets as $t ) {
+            $updated_content = str_replace( $t, $resource_link, $updated_content );
+        }
+
         if ( $updated_content !== $content ) {
             $u = wp_update_post( [ 'ID' => $post_id, 'post_content' => $updated_content ], true );
             if ( is_wp_error( $u ) ) {
@@ -2761,10 +2862,40 @@ function aco_re_promote_controller( WP_REST_Request $request ) {
         }
     }
 
-    // ---- Optional: queue SearchWP reindex ----
-    if ( function_exists( 'do_action' ) && has_action( 'searchwp\\index\\enqueue' ) ) {
-        // SearchWP 4.x queue API
+    /**
+     * Re-index behaviour (SearchWP 4.x queue API)
+     *
+     * Filter: aco_re_reindex_source_on_promote
+     * Decide whether the source post should be re-indexed after a successful promote.
+     * Default: true ONLY when the source previously owned the attachment or its content linked the file.
+     * Signature: (bool $default, int $source_post_id, int $resource_post_id, int $attachment_id): bool
+     *
+     * Filter: aco_re_reindex_attachment_on_promote
+     * Decide whether the attachment itself should be re-indexed.
+     * Default: false. Enable if your SearchWP engines index attachments directly.
+     * Signature: (bool $default, int $source_post_id, int $resource_post_id, int $attachment_id): bool
+     */
+    if ( has_action( 'searchwp\\index\\enqueue' ) ) {
+        // Always enqueue the canonical Resource so its PDF content is indexed there.
         do_action( 'searchwp\\index\\enqueue', 'post', $resource_id );
+
+        // ALSO re-index the source post when warranted (previously owned the PDF or content linked it).
+        $link_present = isset( $has_block, $has_url ) ? ( $has_block || $has_url ) : false;
+        $should_reindex_source = (bool) apply_filters(
+            'aco_re_reindex_source_on_promote',
+            ( $was_parented_to_source || $link_present ),
+            $post_id,
+            $resource_id,
+            $attachment_id
+        );
+        if ( $should_reindex_source ) {
+            do_action( 'searchwp\\index\\enqueue', 'post', $post_id );
+        }
+
+        // Optional: refresh the attachment’s own index entry (disabled by default)
+        if ( (bool) apply_filters( 'aco_re_reindex_attachment_on_promote', false, $post_id, $resource_id, $attachment_id ) ) {
+            do_action( 'searchwp\\index\\enqueue', 'post', $attachment_id );
+        }
     }
 
     // ---- Log & response ----
