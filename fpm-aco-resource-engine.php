@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.19.6
+ * Version:         1.19.7
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -2487,6 +2487,7 @@ add_action( 'rest_api_init', function () {
             'attachmentId' => [ 'type' => 'integer', 'required' => true ],
             'tags'         => [ 'type' => 'array',   'required' => false, 'items' => [ 'type' => 'string' ] ],
             'resourceType' => [ 'type' => 'string',  'required' => false ],
+            'postContent'  => [ 'type' => 'string',  'required' => false ],
         ],
     ] );
 } );
@@ -2517,30 +2518,32 @@ function aco_re_promote_permission_callback(WP_REST_Request $request) {
 }
 
 /**
- * Does the post contain a core/file block with this attachment ID?
- * 
- * Filter: aco_re_promote_block_walk_max_depth
- * Adjust the maximum recursion depth when scanning blocks for a core/file link.
- * Default 10. Return an integer >= 1.
+ * Does the content contain a link to this attachment?
  *
+ * Accepts either a WP_Post or a raw HTML content string.
  * - Recurses innerBlocks
  * - Resolves reusable blocks (core/block → wp_block post via attrs.ref)
  * - Depth limit (filterable) + visited-set to avoid cycles
- * - Compares URL *paths* scheme/host-agnostically (now with rawurldecode())
+ * - Compares URL *paths* scheme/host-agnostically (rawurldecode)
  * - Accepts ?attachment_id=<id> form and basename suffix as last resort
+ * - Recognizes 'href' and generic 'url' attrs (Kadence & others)
  *
- * @param WP_Post $post
- * @param int     $attachment_id
+ * @param WP_Post|string $post_or_content
+ * @param int            $attachment_id
  * @return bool
  */
-function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id ): bool {
+function aco_re_post_has_file_block_with_id( $post_or_content, int $attachment_id ): bool {
     $attachment_id = (int) $attachment_id;
     if ( $attachment_id <= 0 ) { return false; }
 
-    $content = (string) $post->post_content;
+    $content = '';
+    if ( is_string( $post_or_content ) ) {
+        $content = (string) $post_or_content;
+    } elseif ( $post_or_content instanceof WP_Post ) {
+        $content = (string) $post_or_content->post_content;
+    }
     if ( $content === '' ) { return false; }
 
-    // Candidates + canonical filename (host/CDN agnostic)
     $file_url = wp_get_attachment_url( $attachment_id );
     $page_url = get_attachment_link( $attachment_id );
 
@@ -2554,7 +2557,6 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
         if ( $local && file_exists( $local ) ) { $basename = basename( $local ); }
     }
 
-    // Helpers: scheme/host agnostic comparison + attachment_id detector
     $same_path = static function( string $a, string $b ): bool {
         if ( $a === '' || $b === '' ) { return false; }
         $pa = wp_parse_url( $a ); $pb = wp_parse_url( $b );
@@ -2572,7 +2574,6 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
 
     $blocks = parse_blocks( $content );
     if ( is_array( $blocks ) ) {
-        /** Allow integrators to reduce/increase traversal depth (default 10). */
         $max_depth = (int) apply_filters( 'aco_re_promote_block_walk_max_depth', 10 );
         $visited_reusable = [];
 
@@ -2582,33 +2583,35 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
         ): bool {
             if ( $depth > $max_depth ) { return false; }
             foreach ( $list as $b ) {
-                $name = isset( $b['blockName'] ) ? (string) $b['blockName'] : '';
+                $name  = isset( $b['blockName'] ) ? (string) $b['blockName'] : '';
+                $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
 
+                // core/file direct match by id
                 if ( $name === 'core/file' ) {
-                    $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
-                    $id    = isset( $attrs['id'] ) ? (int) $attrs['id'] : 0;
+                    $id = isset( $attrs['id'] ) ? (int) $attrs['id'] : 0;
                     if ( $id === $attachment_id ) { return true; }
+                }
 
-                    $href = isset( $attrs['href'] ) ? (string) $attrs['href'] : '';
-                    if ( $href !== '' ) {
-                        // 1) Exact path equality with file URL or attachment page URL (scheme/host agnostic)
-                        if ( $file_url && $same_path( $href, $file_url ) ) { return true; }
-                        if ( $page_url && $same_path( $href, $page_url ) ) { return true; }
-
-                        // 2) attachment_id query param (e.g. /?attachment_id=123)
-                        if ( $href_points_to_attachment( $href ) ) { return true; }
-
-                        // 3) Last-resort: filename suffix for CDN/host swaps
-                        if ( $basename !== '' ) {
-                            $path = (string) wp_parse_url( $href, PHP_URL_PATH );
-                            if ( $path && substr( $path, -strlen( $basename ) ) === $basename ) { return true; }
-                        }
+                // URL-ish attributes used by many blocks (Kadence, buttons, etc.)
+                $url_candidates = [];
+                foreach ( [ 'href', 'url', 'textLinkHref', 'fileUrl' ] as $key ) {
+                    if ( isset( $attrs[ $key ] ) && is_string( $attrs[ $key ] ) && $attrs[ $key ] !== '' ) {
+                        $url_candidates[] = (string) $attrs[ $key ];
+                    }
+                }
+                foreach ( $url_candidates as $href ) {
+                    if ( $file_url && $same_path( $href, $file_url ) ) { return true; }
+                    if ( $page_url && $same_path( $href, $page_url ) ) { return true; }
+                    if ( $href_points_to_attachment( $href ) ) { return true; }
+                    if ( $basename !== '' ) {
+                        $path = (string) wp_parse_url( $href, PHP_URL_PATH );
+                        if ( $path && substr( $path, -strlen( $basename ) ) === $basename ) { return true; }
                     }
                 }
 
+                // Resolve reusable blocks
                 if ( $name === 'core/block' ) {
-                    $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
-                    $ref   = isset( $attrs['ref'] ) ? (int) $attrs['ref'] : 0;
+                    $ref = isset( $attrs['ref'] ) ? (int) $attrs['ref'] : 0;
                     if ( $ref > 0 && empty( $visited_reusable[ $ref ] ) ) {
                         $visited_reusable[ $ref ] = true;
                         $ref_post = get_post( $ref );
@@ -2629,7 +2632,7 @@ function aco_re_post_has_file_block_with_id( WP_Post $post, int $attachment_id )
         if ( $walker( $blocks, 0 ) ) { return true; }
     }
 
-    // Raw-content fallbacks (exact URL, attachment page URL, or filename / attachment_id param)
+    // Raw-content fallbacks
     if ( $file_url && strpos( $content, $file_url ) !== false ) { return true; }
     if ( $page_url && strpos( $content, $page_url ) !== false ) { return true; }
     if ( $attachment_id && preg_match( '#(?:\?|&)(?:attachment_id)=' . preg_quote( (string) $attachment_id, '#' ) . '\b#', $content ) ) { return true; }
@@ -2684,19 +2687,22 @@ function aco_re_promote_controller( WP_REST_Request $request ) {
         return new WP_Error( 'file_url_missing', __( 'Could not resolve the attachment URL.', 'fpm-aco-resource-engine' ), [ 'status' => 500 ] );
     }
 
-// ---- Verify link presence (block-aware with broader fallbacks) ----
-$content   = (string) $post->post_content;
-$has_block = aco_re_post_has_file_block_with_id( $post, $attachment_id );
-$has_url   = ( $file_url && strpos( $content, $file_url ) !== false );
+// ---- Verify link presence (block-aware; supports unsaved editor content) ----
+$content_saved = (string) $post->post_content;
+$content_live  = (string) ( $request->get_param( 'postContent' ) ?: '' );
+$content_check = $content_live !== '' ? $content_live : $content_saved;
+
+$has_block = aco_re_post_has_file_block_with_id( $content_check, $attachment_id );
+$has_url   = ( $file_url && strpos( $content_check, $file_url ) !== false );
 
 // Attachment page URL present?
 $page_url  = get_attachment_link( $attachment_id );
-$has_page  = ( $page_url && strpos( $content, $page_url ) !== false );
+$has_page  = ( $page_url && strpos( $content_check, $page_url ) !== false );
 
 // Any link using ?attachment_id=<ID> ?
-$has_qs    = (bool) preg_match(
+$has_qs = (bool) preg_match(
     '#href=["\'][^"\']*(?:\?|&)attachment_id=' . preg_quote( (string) $attachment_id, '#' ) . '\b[^"\']*["\']#i',
-    $content
+    $content_check
 );
 
 // Any link whose href ends with the file's basename (plain or URL-encoded)?
@@ -2718,23 +2724,24 @@ $has_basename = false;
 if ( $basename !== '' ) {
     $has_basename = (bool) preg_match(
         '#href=["\'][^"\']*(?:' . preg_quote( $basename, '#' ) . '|' . preg_quote( $basename_enc, '#' ) . ')[^"\']*["\']#i',
-        $content
+        $content_check
     );
 }
 
 if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
     if ( function_exists( 'aco_re_log' ) ) {
-        aco_re_log( 'warning', 'Promote failed: file link not found in post content', [
+        aco_re_log( 'warning', 'Promote failed: file link not found in content (saved/live).', [
             'source'        => 'promote',
             'action'        => 'link_check',
             'post_id'       => $post_id,
             'attachment_id' => $attachment_id,
+            'used_live'     => $content_live !== '',
         ] );
     }
     return new WP_Error(
         'link_not_found',
         __( 'The selected PDF is not present as a File block in this post.', 'fpm-aco-resource-engine' ),
-        [ 'status' => 400, 'postId' => $post_id, 'attachmentId' => $attachment_id ]
+        [ 'status' => 400, 'postId' => $post_id, 'attachmentId' => $attachment_id, 'usedLive' => (bool) ( $content_live !== '' ) ]
     );
 }
 
@@ -2807,22 +2814,22 @@ if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
             _aco_re_set_post_terms_from_names( $resource_id, 'universal_tag', $tags, [ 'source' => 'promote', 'action' => 'set_tags', 'post_id' => $resource_id ], true );
         }
     }
+    // ---- Rewrite the post content link (best-effort; saved + return patched live) ----
+    $resource_link  = get_permalink( $resource_id );
+    $patched_live   = null;
+    $did_rewrite_db = false;
 
-    // ---- Rewrite the post content link (best-effort; broadened) ----
-    $resource_link = get_permalink( $resource_id );
     if ( is_string( $resource_link ) && $resource_link !== '' ) {
-        $updated_content = $content;
-
-        // Known direct targets we can replace 1:1
+        // Build targets based on the canonical file URL and variants
         $targets = array_filter( [
             $file_url,
             get_attachment_link( $attachment_id ),
         ] );
 
-        // Also capture any hrefs with ?attachment_id=<ID>
+        // Also capture any hrefs with ?attachment_id=<ID> in the SAVED content
         if ( preg_match_all(
             '#href=["\']([^"\']*?(?:\?|&)attachment_id=' . preg_quote( (string) $attachment_id, '#' ) . '\b[^"\']*)["\']#i',
-            $content,
+            $content_saved,
             $m
         ) ) {
             foreach ( array_unique( (array) $m[1] ) as $href ) {
@@ -2830,49 +2837,67 @@ if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
             }
         }
 
-        // 1) Exact known URLs → resource permalink
         $targets = array_values( array_unique( array_filter( $targets ) ) );
-        foreach ( $targets as $t ) {
-            $updated_content = str_replace( $t, $resource_link, $updated_content );
-        }
 
         // Compute path + filename for path/filename based rewrites
         $file_path = (string) wp_parse_url( $file_url, PHP_URL_PATH );
         $basename  = $file_path ? basename( $file_path ) : '';
 
-        // Build an encoded variant of the path (to match blocks that URL-encode the href)
+        // Encoded variant of the path (to match blocks that URL-encode the href)
         $encoded_path = '';
         if ( $file_path ) {
             $segments     = array_map( 'rawurlencode', array_filter( explode( '/', ltrim( $file_path, '/' ) ) ) );
             $encoded_path = '/' . implode( '/', $segments );
         }
 
-        // 2) Path-based replace (host-agnostic, keeps existing quotes)
-        if ( $file_path ) {
-            $pattern_by_path = '#href=(["\'])([^"\']*' . preg_quote( $file_path, '#' ) . '(?:[?#][^"\']*)?)\1#i';
-            $updated_content = preg_replace( $pattern_by_path, 'href=$1' . esc_url( $resource_link ) . '$1', $updated_content ) ?? $updated_content;
-        }
-        if ( $encoded_path && $encoded_path !== $file_path ) {
-            $pattern_by_enc_path = '#href=(["\'])([^"\']*' . preg_quote( $encoded_path, '#' ) . '(?:[?#][^"\']*)?)\1#i';
-            $updated_content     = preg_replace( $pattern_by_enc_path, 'href=$1' . esc_url( $resource_link ) . '$1', $updated_content ) ?? $updated_content;
-        }
+        $rewrite_once = static function( string $content ) use ( $targets, $file_path, $encoded_path, $basename, $resource_link ): string {
+            $updated = $content;
 
-        // 3) Filename fallback (handles CDN domain swaps & transformed prefixes)
-        if ( $basename ) {
-            $pattern_by_name = '#href=(["\'])([^"\']*/' . preg_quote( $basename, '#' ) . '(?:[?#][^"\']*)?)\1#i';
-            $updated_content = preg_replace( $pattern_by_name, 'href=$1' . esc_url( $resource_link ) . '$1', $updated_content ) ?? $updated_content;
-        }
+            // 1) Exact known URLs → resource permalink
+            foreach ( $targets as $t ) {
+                $updated = str_replace( $t, $resource_link, $updated );
+            }
 
-        if ( $updated_content !== $content ) {
-            $u = wp_update_post( [ 'ID' => $post_id, 'post_content' => $updated_content ], true );
+            // 2) Path-based replace (host-agnostic, keeps existing quotes)
+            if ( $file_path ) {
+                $pattern_by_path = '#href=(["\'])([^"\']*' . preg_quote( $file_path, '#' ) . '(?:[?#][^"\']*)?)\1#i';
+                $updated = preg_replace( $pattern_by_path, 'href=$1' . esc_url( $resource_link ) . '$1', $updated ) ?? $updated;
+            }
+            if ( $encoded_path && $encoded_path !== $file_path ) {
+                $pattern_by_enc_path = '#href=(["\'])([^"\']*' . preg_quote( $encoded_path, '#' ) . '(?:[?#][^"\']*)?)\1#i';
+                $updated = preg_replace( $pattern_by_enc_path, 'href=$1' . esc_url( $resource_link ) . '$1', $updated ) ?? $updated;
+            }
+
+            // 3) Filename fallback (handles CDN domain swaps & transformed prefixes)
+            if ( $basename ) {
+                $pattern_by_name = '#href=(["\'])([^"\']*/' . preg_quote( $basename, '#' ) . '(?:[?#][^"\']*)?)\1#i';
+                $updated = preg_replace( $pattern_by_name, 'href=$1' . esc_url( $resource_link ) . '$1', $updated ) ?? $updated;
+            }
+
+            return $updated;
+        };
+
+        // Rewrite saved DB content
+        $updated_saved = $rewrite_once( $content_saved );
+        if ( $updated_saved !== $content_saved ) {
+            $u = wp_update_post( [ 'ID' => $post_id, 'post_content' => $updated_saved ], true );
+            $did_rewrite_db = ! is_wp_error( $u );
             if ( is_wp_error( $u ) && function_exists( 'aco_re_log' ) ) {
-                aco_re_log( 'warning', 'Content rewrite failed.', [
+                aco_re_log( 'warning', 'Content rewrite failed (DB).', [
                     'source'        => 'promote',
                     'action'        => 'rewrite',
                     'post_id'       => $post_id,
                     'attachment_id' => $attachment_id,
                     'error'         => $u->get_error_message(),
                 ] );
+            }
+        }
+
+        // If live/unsaved content was provided, return a patched version for the editor to adopt
+        if ( $content_live !== '' ) {
+            $updated_live = $rewrite_once( $content_live );
+            if ( $updated_live !== $content_live ) {
+                $patched_live = $updated_live;
             }
         }
     }
@@ -2936,11 +2961,14 @@ if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
     }
 
     return new WP_REST_Response( [
-        'status'       => 'ok',
-        'resourceId'   => (int) $resource_id,
-        'attachmentId' => (int) $attachment_id,
-        'postId'       => (int) $post_id,
-        'link'         => (string) get_permalink( $resource_id ),
+        'status'             => 'ok',
+        'resourceId'         => (int) $resource_id,
+        'attachmentId'       => (int) $attachment_id,
+        'postId'             => (int) $post_id,
+        'link'               => (string) get_permalink( $resource_id ),
+        'usedUnsavedContent' => (bool) ( $content_live !== '' ),
+        'didRewriteSaved'    => (bool) $did_rewrite_db,
+        'patchedContent'     => ( $patched_live !== null ) ? (string) $patched_live : null,
     ], 200 );
 }
 

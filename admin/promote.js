@@ -3,6 +3,7 @@
 
   wp.domReady(function () {
     const { select, subscribe, dispatch } = wp.data;
+    const apiFetch = wp.apiFetch;
     const notices = dispatch("core/notices");
     const promptedFor = new Set();
 
@@ -57,16 +58,32 @@
 
       const handlePromote = async () => {
         try {
-          const res = await wp.apiFetch({
+          const editedContent = select("core/editor").getEditedPostContent() || "";
+          const res = await apiFetch({
             path: "/aco/v1/promote",
             method: "POST",
-            data: { postId, attachmentId },
+            data: {
+              postId,
+              attachmentId,
+              postContent: editedContent,
+            },
           });
+          if (res && typeof res.patchedContent === "string" && res.patchedContent.length) {
+            const current = select("core/editor").getEditedPostContent() || "";
+            if (current !== res.patchedContent) {
+              dispatch("core/editor").editPost({ content: res.patchedContent });
+            }
+          }
           notices.createNotice("success", "Promoted to the Resource Library.", {
             isDismissible: true,
             actions:
-              res && res.resourcePermalink
-                ? [{ label: "View Resource", url: res.resourcePermalink }]
+              res && (res.resourcePermalink || res.link)
+                ? [
+                    {
+                      label: "View Resource",
+                      url: res.resourcePermalink || res.link,
+                    },
+                  ]
                 : [],
           });
         } catch (e) {
