@@ -58,7 +58,8 @@
 
       const handlePromote = async () => {
         try {
-          const editedContent = select("core/editor").getEditedPostContent() || "";
+          const editedContent =
+            select("core/editor").getEditedPostContent() || "";
           const res = await apiFetch({
             path: "/aco/v1/promote",
             method: "POST",
@@ -68,7 +69,11 @@
               postContent: editedContent,
             },
           });
-          if (res && typeof res.patchedContent === "string" && res.patchedContent.length) {
+          if (
+            res &&
+            typeof res.patchedContent === "string" &&
+            res.patchedContent.length
+          ) {
             const current = select("core/editor").getEditedPostContent() || "";
             if (current !== res.patchedContent) {
               dispatch("core/editor").editPost({ content: res.patchedContent });
@@ -90,16 +95,16 @@
           const apiMsg =
             (e && e.message) ||
             (e && e.data && e.data.message) ||
-            'Could not promote this file to the Resource Library, please try again';
+            "Could not promote this file to the Resource Library, please try again";
 
-          console.error('ACO promote failed:', e);
+          console.error("ACO promote failed:", e);
 
-          notices.createNotice('error', apiMsg, {
+          notices.createNotice("error", apiMsg, {
             isDismissible: true,
             actions: [
               // lets users immediately retry without re-uploading
-              { label: 'Try again', onClick: handlePromote }
-            ]
+              { label: "Try again", onClick: handlePromote },
+            ],
           });
         } finally {
           dispatch("core/notices").removeNotice(noticeId);
