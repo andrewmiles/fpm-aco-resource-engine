@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.19.8
+ * Version:         1.20.1
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -645,38 +645,340 @@ function aco_re_purge_old_logs() {
     );
 }
 
-// --- WP-CLI Commands ---
+// --- WP-CLI Helpers: Sync Replay & Log Export + Aliases (refined) ---
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
+
+    if ( ! class_exists( 'ACO_RE_CLI_Media' ) ) :
     class ACO_RE_CLI_Media {
         public function flip( $args, $assoc_args ) {
             $destination = strtolower( $assoc_args['to'] ?? '' );
-            if ( ! in_array( $destination, [ 's3', 'wasabi' ], true ) ) { WP_CLI::error( 'Invalid destination. Please use --to=s3 or --to=wasabi' ); return; }
-            $current_origin = get_option( 'aco_re_active_media_origin', 's3' );
-            if ( $current_origin === $destination ) { WP_CLI::warning( "Media origin is already set to '$destination'. No change made." ); return; }
-            if ( 'wasabi' === $destination ) {
-                WP_CLI::log( 'Running pre-flip safety probe...' );
-                $health = aco_re_perform_health_probe( 10, true );
-                if ( ! $health['all_found'] ) { WP_CLI::error( 'Failover to Wasabi blocked. The mirror is missing recent files. Check rclone sync log.' ); return; }
-                WP_CLI::log( 'Probe passed. Mirror is healthy.' );
+
+            if ( ! in_array( $destination, [ 's3', 'wasabi' ], true ) ) {
+                \WP_CLI::error( 'Invalid destination. Please use --to=s3 or --to=wasabi' );
+                return;
             }
+
+            $current_origin = get_option( 'aco_re_active_media_origin', 's3' );
+            if ( $current_origin === $destination ) {
+                \WP_CLI::warning( "Media origin is already set to '$destination'. No change made." );
+                return;
+            }
+
+            if ( 'wasabi' === $destination ) {
+                \WP_CLI::log( 'Running pre-flip safety probe...' );
+                $health = aco_re_perform_health_probe( 10, true );
+                if ( empty( $health['all_found'] ) ) {
+                    \WP_CLI::error( 'Failover to Wasabi blocked. The mirror is missing recent files. Check rclone sync log.' );
+                    return;
+                }
+                \WP_CLI::log( 'Probe passed. Mirror is healthy.' );
+            }
+
             update_option( 'aco_re_active_media_origin', $destination );
-            if ( function_exists('litespeed_purge_all') ) { litespeed_purge_all(); WP_CLI::log( 'LiteSpeed cache purged.' ); }
+
+            if ( function_exists( 'litespeed_purge_all' ) ) {
+                litespeed_purge_all();
+                \WP_CLI::log( 'LiteSpeed cache purged.' );
+            }
+
             delete_transient( 'aco_mirror_health_probe_results' );
-            WP_CLI::success( "Flipped active media origin to '$destination'." );
+            \WP_CLI::success( "Flipped active media origin to '$destination'." );
         }
     }
+    endif;
+
+    if ( ! class_exists( 'ACO_RE_CLI_Health' ) ) :
     class ACO_RE_CLI_Health {
         public function probe( $args, $assoc_args ) {
-            WP_CLI::log( 'Probing Wasabi mirror health...' );
+            \WP_CLI::log( 'Probing Wasabi mirror health...' );
             $results = aco_re_perform_health_probe( 10, true );
-            if ( $results['checked'] === 0 ) { WP_CLI::warning( 'No recent offloaded media uploads found to check.' ); return; }
-            $table_data = array_map( function($file) { return [ 'File' => basename( $file['key'] ), 'Status' => strtoupper( $file['status'] ), 'Code' => $file['code'] ?: 'N/A' ]; }, $results['files']);
-            WP_CLI\Utils\format_items( 'table', $table_data, [ 'File', 'Status', 'Code' ] );
-            if ( $results['all_found'] ) { WP_CLI::success( 'Mirror is healthy. All recent uploads were found.' ); } else { WP_CLI::error( 'Mirror health warning. One or more recent uploads are missing or not public.' ); }
+
+            if ( empty( $results['checked'] ) ) {
+                \WP_CLI::warning( 'No recent offloaded media uploads found to check.' );
+                return;
+            }
+
+            $table_data = array_map(
+                function( $file ) {
+                    return [
+                        'File'   => basename( (string) ( $file['key'] ?? '' ) ),
+                        'Status' => strtoupper( (string) ( $file['status'] ?? '' ) ),
+                        'Code'   => (string) ( $file['code'] ?? 'N/A' ),
+                    ];
+                },
+                (array) ( $results['files'] ?? [] )
+            );
+
+            \WP_CLI\Utils\format_items( 'table', $table_data, [ 'File', 'Status', 'Code' ] );
+
+            if ( ! empty( $results['all_found'] ) ) {
+                \WP_CLI::success( 'Mirror is healthy. All recent uploads were found.' );
+            } else {
+                \WP_CLI::error( 'Mirror health warning. One or more recent uploads are missing or not public.' );
+            }
         }
     }
-    WP_CLI::add_command( 'aco media', 'ACO_RE_CLI_Media' );
-    WP_CLI::add_command( 'aco health', 'ACO_RE_CLI_Health' );
+    endif;
+
+    if ( ! class_exists( 'ACO_RE_CLI_Sync' ) ) :
+    class ACO_RE_CLI_Sync {
+        /**
+         * Replay failed sync jobs using payloads embedded in log messages.
+         *
+         * ## OPTIONS
+         *
+         * [--since=<window>]
+         * : Time window (e.g. '24h', '7d', '2025-10-01'). Default '24h'.
+         *
+         * [--limit=<n>]
+         * : Max rows to inspect. Default 500.
+         *
+         * [--with-warnings]
+         * : Include 'warning' rows in addition to failed/error (default is failed|error only).
+         *
+         * [--id=<log_id>]
+         * : Replay a single log row by its numeric id (overrides --since/--limit).
+         *
+         * [--record-id=<recXXXX>]
+         * : Filter by Airtable record id. Useful for a targeted replay.
+         *
+         * [--dry-run]
+         * : Show what would be re-queued without enqueuing.
+         *
+         * ## EXAMPLES
+         *   wp aco sync replay --since=24h
+         *   wp aco sync replay --with-warnings --record-id=recABC123
+         *   wp aco sync replay --id=12345 --dry-run
+         */
+        public function replay( $args, $assoc_args ) {
+            global $wpdb;
+
+            $limit           = isset( $assoc_args['limit'] ) ? max( 1, (int) $assoc_args['limit'] ) : 500;
+            $since_raw       = isset( $assoc_args['since'] ) ? (string) $assoc_args['since'] : '24h';
+            $includeWarnings = isset( $assoc_args['with-warnings'] );
+            $log_id          = isset( $assoc_args['id'] ) ? max( 0, (int) $assoc_args['id'] ) : 0;
+            $record_id_eq    = isset( $assoc_args['record-id'] ) ? sanitize_text_field( (string) $assoc_args['record-id'] ) : '';
+            $dry_run         = isset( $assoc_args['dry-run'] );
+
+            $table    = $wpdb->prefix . 'aco_sync_log';
+            $fields   = 'id, ts, status, record_id, message';
+            $where    = [];
+
+            if ( $log_id > 0 ) {
+                $where[] = $wpdb->prepare( 'id = %d', $log_id );
+            } else {
+                $since_dt = $this->parse_since_to_utc( $since_raw );
+                $where[]  = $wpdb->prepare( 'ts >= %s', $since_dt );
+                $where[]  = $includeWarnings
+                    ? "status IN ('failed','error','warning')"
+                    : "status IN ('failed','error')";
+                if ( $record_id_eq !== '' ) {
+                    $where[] = $wpdb->prepare( 'record_id = %s', $record_id_eq );
+                }
+            }
+
+            $where_sql = $where ? ( 'WHERE ' . implode( ' AND ', $where ) ) : '';
+            $limit_sql = $log_id > 0 ? '' : " LIMIT {$limit}";
+
+            $sql  = "SELECT {$fields} FROM {$table} {$where_sql} ORDER BY id DESC{$limit_sql}";
+            $rows = (array) $wpdb->get_results( $sql, ARRAY_A );
+
+            if ( empty( $rows ) ) {
+                \WP_CLI::warning( 'No candidate log entries found for replay.' );
+                return;
+            }
+
+            $enqueued = 0;
+            $skipped  = 0;
+            $items    = [];
+
+            foreach ( $rows as $r ) {
+                $parsed   = function_exists( 'aco_re_safe_parse_message' ) ? aco_re_safe_parse_message( (string) ( $r['message'] ?? '' ) ) : [];
+                $context  = is_array( $parsed ) ? ( $parsed['context'] ?? [] ) : [];
+                $payload  = is_array( $context ) ? ( $context['payload'] ?? null ) : null;
+
+                if ( is_array( $payload ) && ! empty( $payload ) ) {
+                    if ( $dry_run ) {
+                        $enqueued++;
+                        $items[] = [ 'Log ID' => (int) $r['id'], 'Record' => (string) ( $r['record_id'] ?? '' ), 'Action' => 'WOULD ENQUEUE' ];
+                    } else {
+                        $ok = function_exists( 'aco_re_enqueue_sync_job' ) ? aco_re_enqueue_sync_job( $payload ) : false;
+                        if ( $ok ) {
+                            $enqueued++;
+                            $items[] = [ 'Log ID' => (int) $r['id'], 'Record' => (string) ( $r['record_id'] ?? '' ), 'Action' => 'ENQUEUED' ];
+                            continue;
+                        }
+                        $skipped++;
+                        $items[] = [ 'Log ID' => (int) $r['id'], 'Record' => (string) ( $r['record_id'] ?? '' ), 'Action' => 'ENQUEUE FAILED' ];
+                    }
+                    continue;
+                }
+
+                $skipped++;
+                $items[] = [ 'Log ID' => (int) $r['id'], 'Record' => (string) ( $r['record_id'] ?? '' ), 'Action' => 'SKIPPED (no payload)' ];
+            }
+
+            if ( ! empty( $items ) ) {
+                \WP_CLI\Utils\format_items( 'table', $items, [ 'Log ID', 'Record', 'Action' ] );
+            }
+
+            \WP_CLI::success(
+                sprintf(
+                    'Replay %s. Enqueued: %d, Skipped: %d',
+                    $dry_run ? 'dry-run complete' : 'complete',
+                    $enqueued,
+                    $skipped
+                )
+            );
+        }
+
+        private function parse_since_to_utc( string $since ) : string {
+            $since = trim( $since );
+            $now   = time();
+
+            if ( preg_match( '/^(\d+)\s*h$/i', $since, $m ) ) {
+                $ts = $now - ( (int) $m[1] * HOUR_IN_SECONDS );
+            } elseif ( preg_match( '/^(\d+)\s*d$/i', $since, $m ) ) {
+                $ts = $now - ( (int) $m[1] * DAY_IN_SECONDS );
+            } elseif ( preg_match( '/^\d{4}-\d{2}-\d{2}/', $since ) ) {
+                $ts = strtotime( $since . ' 00:00:00 UTC' ) ?: ( $now - DAY_IN_SECONDS );
+            } else {
+                $ts = $now - DAY_IN_SECONDS;
+            }
+            return gmdate( 'Y-m-d H:i:s', $ts );
+        }
+    }
+    endif;
+
+    if ( ! class_exists( 'ACO_RE_CLI_Log' ) ) :
+    class ACO_RE_CLI_Log {
+        /**
+         * Export sync log entries as CSV or table.
+         *
+         * ## OPTIONS
+         *
+         * [--since=<window>]
+         * : Time window (e.g. '24h', '7d', '2025-10-01'). Default '24h'.
+         *
+         * [--status=<status>]
+         * : Filter by status (success|warning|failed|error). Default: all.
+         *
+         * [--format=<format>]
+         * : Output format (csv|table). Default: csv.
+         *
+         * [--limit=<n>]
+         * : Max rows. Default 5000 (use higher values explicitly if needed).
+         *
+         * [--safe]
+         * : When --format=csv, prefix formula-like cells (CSV injection hardening).
+         *
+         * ## EXAMPLES
+         *   wp aco log export --since=7d --status=failed --format=csv --limit=5000 > sync-log.csv
+         */
+        public function export( $args, $assoc_args ) {
+            global $wpdb;
+
+            $since_raw = isset( $assoc_args['since'] ) ? (string) $assoc_args['since'] : '24h';
+            $format    = isset( $assoc_args['format'] ) ? strtolower( (string) $assoc_args['format'] ) : 'csv';
+            $status_in = isset( $assoc_args['status'] ) ? strtolower( (string) $assoc_args['status'] ) : '';
+            $limit     = isset( $assoc_args['limit'] ) ? max( 1, (int) $assoc_args['limit'] ) : 5000;
+            $safe_csv  = isset( $assoc_args['safe'] );
+
+            $since_dt  = $this->parse_since_to_utc( $since_raw );
+            $table     = $wpdb->prefix . 'aco_sync_log';
+
+            $where = [ $wpdb->prepare( 'ts >= %s', $since_dt ) ];
+            $allowed = [ 'success','warning','failed','error' ];
+            if ( in_array( $status_in, $allowed, true ) ) {
+                $where[] = $wpdb->prepare( 'status = %s', $status_in );
+            }
+
+            $fields = [ 'id','ts','source','record_id','last_modified','action','resource_id','attachment_id','fingerprint','status','attempts','duration_ms','error_code' ];
+            $sql    = "SELECT " . implode( ',', $fields ) . " FROM {$table} WHERE " . implode( ' AND ', $where ) . " ORDER BY id DESC LIMIT {$limit}";
+            $rows   = (array) $wpdb->get_results( $sql, ARRAY_A );
+
+            $format = in_array( $format, [ 'csv','table' ], true ) ? $format : 'csv';
+
+            if ( $format === 'csv' && $safe_csv && function_exists( 'aco_re_csv_safe_cell' ) ) {
+                foreach ( $rows as &$row ) {
+                    foreach ( $row as $k => $v ) {
+                        $row[ $k ] = aco_re_csv_safe_cell( $v );
+                    }
+                }
+                unset( $row );
+            }
+
+            \WP_CLI\Utils\format_items( $format, $rows, $fields );
+        }
+
+        private function parse_since_to_utc( string $since ) : string {
+            $since = trim( $since );
+            $now   = time();
+
+            if ( preg_match( '/^(\d+)\s*h$/i', $since, $m ) ) {
+                $ts = $now - ( (int) $m[1] * HOUR_IN_SECONDS );
+            } elseif ( preg_match( '/^(\d+)\s*d$/i', $since, $m ) ) {
+                $ts = $now - ( (int) $m[1] * DAY_IN_SECONDS );
+            } elseif ( preg_match( '/^\d{4}-\d{2}-\d{2}/', $since ) ) {
+                $ts = strtotime( $since . ' 00:00:00 UTC' ) ?: ( $now - DAY_IN_SECONDS );
+            } else {
+                $ts = $now - DAY_IN_SECONDS;
+            }
+            return gmdate( 'Y-m-d H:i:s', $ts );
+        }
+    }
+    endif;
+
+    // Register canonical commands
+    \WP_CLI::add_command( 'aco media', 'ACO_RE_CLI_Media' );
+    \WP_CLI::add_command( 'aco health', 'ACO_RE_CLI_Health' );
+    \WP_CLI::add_command( 'aco sync', 'ACO_RE_CLI_Sync' );
+    \WP_CLI::add_command( 'aco log',  'ACO_RE_CLI_Log' );
+
+    // Colon aliases to match project docs/spec
+    \WP_CLI::add_command( 'aco sync:replay', function( $args, $assoc_args ) {
+        ( new ACO_RE_CLI_Sync() )->replay( $args, $assoc_args );
+    } );
+    \WP_CLI::add_command( 'aco log:export', function( $args, $assoc_args ) {
+        ( new ACO_RE_CLI_Log() )->export( $args, $assoc_args );
+    } );
+    \WP_CLI::add_command( 'aco media:flip', function( $args, $assoc_args ) {
+        ( new ACO_RE_CLI_Media() )->flip( $args, $assoc_args );
+    } );
+
+    \WP_CLI::add_command( 'aco health:probe', function( $args, $assoc_args ) {
+        // Delegate to the canonical implementation when using default count (avoids drift).
+        $count = isset( $assoc_args['count'] ) ? max( 1, (int) $assoc_args['count'] ) : 10;
+
+        if ( $count === 10 && class_exists( 'ACO_RE_CLI_Health' ) && method_exists( 'ACO_RE_CLI_Health', 'probe' ) ) {
+            ( new ACO_RE_CLI_Health() )->probe( $args, $assoc_args );
+            return;
+        }
+
+        \WP_CLI::log( 'Probing Wasabi mirror health...' );
+        $results = function_exists( 'aco_re_perform_health_probe' ) ? aco_re_perform_health_probe( $count, true ) : [ 'checked' => 0, 'all_found' => false, 'files' => [] ];
+
+        if ( $results['checked'] === 0 ) {
+            \WP_CLI::warning( 'No recent offloaded media uploads found to check.' );
+            return;
+        }
+
+        $table_data = array_map( function( $file ) {
+            return [
+                'File'   => basename( (string) ( $file['key'] ?? '' ) ),
+                'Status' => strtoupper( (string) ( $file['status'] ?? 'unknown' ) ),
+                'Code'   => (string) ( $file['code'] ?? 'N/A' ),
+            ];
+        }, (array) $results['files'] );
+
+        \WP_CLI\Utils\format_items( 'table', $table_data, [ 'File', 'Status', 'Code' ] );
+
+        if ( ! empty( $results['all_found'] ) ) {
+            \WP_CLI::success( 'Mirror is healthy. All recent uploads were found.' );
+        } else {
+            \WP_CLI::error( 'Mirror health warning. One or more recent uploads are missing or not public.' );
+        }
+    } );
 }
 
 // --- Webhook & Sync Processing ---
