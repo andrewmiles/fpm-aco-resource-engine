@@ -1,148 +1,144 @@
-(function () {
-  if (!window.wp || !wp.data || !wp.domReady || !wp.apiFetch) return;
+(function (wp) {
+	if (
+		!wp ||
+		!wp.plugins ||
+		!wp.editPost ||
+		!wp.components ||
+		!wp.data ||
+		!wp.element ||
+		!wp.apiFetch
+	) {
+		return;
+	}
 
-  wp.domReady(function () {
-    const { select, subscribe, dispatch } = wp.data;
-    const apiFetch = wp.apiFetch;
-    const notices = dispatch("core/notices");
-    const promptedFor = new Set();
+	const { registerPlugin } = wp.plugins;
+	const { PluginMoreMenuItem } = wp.editPost;
+	const { __ } = wp.i18n || ((s) => s);
+	const { select, dispatch } = wp.data;
+	const { createElement: el, useState } = wp.element;
 
-    // --- Snooze (per post + attachment), persisted across sessions for this browser ---
-    const snoozeKey = (postId, attachmentId) =>
-      `aco-promote-snooze:${postId}:${attachmentId}`;
-    const isSnoozed = (postId, attachmentId) => {
-      try {
-        return !!localStorage.getItem(snoozeKey(postId, attachmentId));
-      } catch (e) {
-        return false;
-      }
-    };
-    const snooze = (postId, attachmentId) => {
-      try {
-        localStorage.setItem(snoozeKey(postId, attachmentId), "1");
-      } catch (e) {}
-    };
+	function extractAttachmentIdFromBlock(block) {
+		if (!block || !block.attributes) {
+			return 0;
+		}
+		const attrs = block.attributes;
+		if (Number.isFinite(attrs.id)) {
+			return parseInt(attrs.id, 10) || 0;
+		}
+		if (attrs.href && typeof attrs.href === 'string') {
+			const match = attrs.href.match(/[?&]attachment_id=(\d+)/);
+			if (match) {
+				return parseInt(match[1], 10) || 0;
+			}
+		}
+		return 0;
+	}
 
-    function isPdfFileBlock(block) {
-      if (!block || block.name !== "core/file") return false;
-      const href = block.attributes && block.attributes.href;
-      return typeof href === "string" && /\.pdf(\?|$)/i.test(href);
-    }
+	const PromoteMenuItem = () => {
+		const [busy, setBusy] = useState(false);
 
-    function findNewPdfBlock() {
-      const blocks = select("core/block-editor").getBlocks() || [];
-      for (const b of blocks) {
-        if (!isPdfFileBlock(b)) continue;
-        const href = (b.attributes && b.attributes.href) || "";
-        const id = (b.attributes && b.attributes.id) || 0;
-        const key = id ? `id:${id}` : `href:${href}`;
-        if (!promptedFor.has(key)) {
-          promptedFor.add(key);
-          return { block: b, href, id };
-        }
-      }
-      return null;
-    }
+		const doPromote = async () => {
+			try {
+				setBusy(true);
+				const editorSel = select('core/editor');
+				const blockSel = select('core/block-editor');
 
-    subscribe(function () {
-      const found = findNewPdfBlock();
-      if (!found) return;
+				const postId = editorSel.getCurrentPostId();
+				const content = editorSel.getEditedPostContent();
 
-      const { id: attachmentId } = found;
-      const postId = select("core/editor").getCurrentPostId();
-      if (!postId || !attachmentId) return;
+				const selectedId =
+					blockSel.getSelectedBlockClientId &&
+					blockSel.getSelectedBlockClientId();
+				const block = selectedId ? blockSel.getBlock(selectedId) : null;
 
-      if (isSnoozed(postId, attachmentId)) return;
+				if (!block || block.name !== 'core/file') {
+					dispatch('core/notices').createNotice(
+						'error',
+						__(
+							'Select a File block linked to a PDF before running Promote.',
+							'fpm-aco-resource-engine'
+						),
+						{ isDismissible: true }
+					);
+					setBusy(false);
+					return;
+				}
 
-      const noticeId = "aco-promote-" + attachmentId;
+				const attachmentId = extractAttachmentIdFromBlock(block);
+				if (!attachmentId) {
+					dispatch('core/notices').createNotice(
+						'error',
+						__(
+							'Could not resolve the attachment ID from the selected File block.',
+							'fpm-aco-resource-engine'
+						),
+						{ isDismissible: true }
+					);
+					setBusy(false);
+					return;
+				}
 
-      const handlePromote = async () => {
-        try {
-          const editedContent =
-            select("core/editor").getEditedPostContent() || "";
-          const res = await apiFetch({
-            path: "/aco/v1/promote",
-            method: "POST",
-            data: {
-              postId,
-              attachmentId,
-              postContent: editedContent,
-            },
-          });
-          if (
-            res &&
-            typeof res.patchedContent === "string" &&
-            res.patchedContent.length
-          ) {
-            const current = select("core/editor").getEditedPostContent() || "";
-            if (current !== res.patchedContent) {
-              dispatch("core/editor").editPost({ content: res.patchedContent });
-            }
-          }
-          notices.createNotice("success", "Promoted to the Resource Library.", {
-            isDismissible: true,
-            actions:
-              res && (res.resourcePermalink || res.link)
-                ? [
-                    {
-                      label: "View Resource",
-                      url: res.resourcePermalink || res.link,
-                    },
-                  ]
-                : [],
-          });
-        } catch (e) {
-          const apiMsg =
-            (e && e.message) ||
-            (e && e.data && e.data.message) ||
-            "Could not promote this file to the Resource Library, please try again";
+				const res = await wp.apiFetch({
+					path: '/aco/v1/promote',
+					method: 'POST',
+					data: {
+						postId,
+						attachmentId,
+						postContent: content,
+					},
+				});
 
-          console.error("ACO promote failed:", e);
+				if (res && res.patchedContent) {
+					dispatch('core/editor').editPost({ content: res.patchedContent });
+				}
 
-          notices.createNotice("error", apiMsg, {
-            isDismissible: true,
-            actions: [
-              // lets users immediately retry without re-uploading
-              { label: "Try again", onClick: handlePromote },
-            ],
-          });
-        } finally {
-          dispatch("core/notices").removeNotice(noticeId);
-        }
-      };
+				const link = res && res.link ? res.link : null;
+				dispatch('core/notices').createNotice(
+					'success',
+					link
+						? __(
+								'Promoted to Resource. Link updated to the canonical Resource page.',
+								'fpm-aco-resource-engine'
+						  )
+						: __('Promoted to Resource.', 'fpm-aco-resource-engine'),
+					{
+						isDismissible: true,
+						actions: link
+							? [
+									{
+										label: __('Open Resource', 'fpm-aco-resource-engine'),
+										url: link,
+									},
+							  ]
+							: [],
+					}
+				);
+			} catch (e) {
+				const msg =
+					(e && e.message) ||
+					__('Promote failed. Check console.', 'fpm-aco-resource-engine');
+				dispatch('core/notices').createNotice('error', msg, {
+					isDismissible: true,
+				});
+				// eslint-disable-next-line no-console
+				console.error('[ACO Promote] Error:', e);
+			} finally {
+				setBusy(false);
+			}
+		};
 
-      // Clear, non-jargony copy + reasons (amber background)
-      const message = [
-        "Add this PDF to the Resource Library?",
-        "",
-        "Promoting will:",
-        "(1) create a single library item with a stable link,",
-        "(2) make it easier to find in site search, and",
-        "(3) keep tags consistent using the approved list.",
-        "",
-        "If this PDF is only relevant to this post, choose 'Keep in this post' or close this message.",
-        "Choose 'Don't ask again' to hide this prompt for this PDF in this post.",
-      ].join("\n");
+		return el(
+			PluginMoreMenuItem,
+			{
+				icon: busy ? 'update' : 'yes',
+				onClick: doPromote,
+				disabled: busy,
+			},
+			busy
+				? __('Promoting…', 'fpm-aco-resource-engine')
+				: __('Promote selected PDF to Resource', 'fpm-aco-resource-engine')
+		);
+	};
 
-      dispatch("core/notices").createNotice("warning", message, {
-        id: noticeId,
-        isDismissible: true, // closing (X) == Keep in this post
-        speak: true,
-        actions: [
-          { label: "Promote to Resource", onClick: handlePromote },
-          {
-            label: "Keep in this post",
-            onClick: () => dispatch("core/notices").removeNotice(noticeId),
-          },
-          {
-            label: "Don't ask again",
-            onClick: () => {
-              snooze(postId, attachmentId);
-              dispatch("core/notices").removeNotice(noticeId);
-            },
-          },
-        ],
-      });
-    });
-  });
-})();
+	registerPlugin('aco-promote', { render: PromoteMenuItem });
+})(window.wp);

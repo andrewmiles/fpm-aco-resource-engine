@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.20.1
+ * Version:         1.17.2
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -235,89 +235,59 @@ function aco_re_render_tag_refresh_button() {
 }
 
 function aco_re_refresh_tag_allowlist() {
-    $api_key  = _aco_re_get_config( 'ACO_AT_API_KEY' );
-    $base_id  = _aco_re_get_config( 'ACO_AT_BASE_ID' );
-    $table_id = _aco_re_get_config( 'ACO_AT_TABLE_TAGS' );
+    $api_key  = getenv( 'ACO_AT_API_KEY' );
+    $base_id  = getenv( 'ACO_AT_BASE_ID' );
+    $table_id = getenv( 'ACO_AT_TABLE_TAGS' );
 
-    if ( ! $api_key || ! $base_id || ! $table_id ) {
-        return new WP_Error( 'aco_re_missing_creds', __( 'Airtable API credentials are not configured in environment variables.', 'fpm-aco-resource-engine' ) );
-    }
+    if ( ! $api_key || ! $base_id || ! $table_id ) { return new WP_Error( 'aco_re_missing_creds', __( 'Airtable API credentials are not configured in environment variables.', 'fpm-aco-resource-engine' ) ); }
 
-    $endpoint   = "https://api.airtable.com/v0/{$base_id}/{$table_id}";
-    $headers    = [ 'Authorization' => 'Bearer ' . $api_key ];
-    $have_cache = ( false !== get_transient( 'aco_re_tag_allowlist' ) );
-
-    if ( $stored_etag = get_option( 'aco_re_tag_allowlist_etag', '' ) ) {
-        $headers['If-None-Match'] = $stored_etag;
-    }
+    $endpoint = "https://api.airtable.com/v0/{$base_id}/{$table_id}";
+    $headers = [ 'Authorization' => 'Bearer ' . $api_key ];
+    if ( $stored_etag = get_option( 'aco_re_tag_allowlist_etag', '' ) ) { $headers['If-None-Match'] = $stored_etag; }
 
     $all_records = [];
     $offset      = null;
     $attempt     = 0;
-
     do {
         $attempt++;
-        $args       = [ 'headers' => $headers, 'timeout' => 15, 'redirection' => 0 ];
+        $args = [ 'headers' => $headers, 'timeout' => 15, 'redirection' => 0 ];
         $query_args = [ 'pageSize' => 100 ];
-
         if ( $offset ) {
             $query_args['offset'] = $offset;
             unset( $args['headers']['If-None-Match'] );
         }
-
         $response = wp_remote_get( add_query_arg( $query_args, $endpoint ), $args );
         if ( is_wp_error( $response ) ) { return $response; }
 
-        $code = (int) wp_remote_retrieve_response_code( $response );
-
-        // Treat 304 as success only if we already have a cache to serve.
-        if ( 304 === $code ) {
-            if ( $have_cache ) {
+        $response_code = wp_remote_retrieve_response_code( $response );
+        if ( 304 === (int) $response_code ) {
+            if ( false !== get_transient( 'aco_re_tag_allowlist' ) ) {
                 update_option( 'aco_re_tag_allowlist_last_sync', time() );
                 return true;
             }
-            // No cache but 304 → drop ETag and refetch to repopulate.
-            unset( $headers['If-None-Match'] );
-            $have_cache = true; // prevent infinite loop; next fetch aims for 200
-            continue;
         }
-
-        if ( 200 !== $code ) {
-            return new WP_Error(
-                'aco_re_api_error',
-                sprintf( __( 'Airtable API returned an error. Code: %d', 'fpm-aco-resource-engine' ), $code )
-            );
-        }
+        if ( 200 !== (int) $response_code ) { return new WP_Error( 'aco_re_api_error', sprintf( __( 'Airtable API returned an error. Code: %d', 'fpm-aco-resource-engine' ), (int) $response_code ) ); }
 
         $body = wp_remote_retrieve_body( $response );
         $data = json_decode( $body, true );
-        if ( ! is_array( $data ) || ! isset( $data['records'] ) ) {
-            return new WP_Error( 'aco_re_invalid_response', __( 'Invalid response format from Airtable API.', 'fpm-aco-resource-engine' ) );
-        }
+        if ( ! is_array( $data ) || ! isset( $data['records'] ) ) { return new WP_Error( 'aco_re_invalid_response', __( 'Invalid response format from Airtable API.', 'fpm-aco-resource-engine' ) ); }
 
         $all_records = array_merge( $all_records, $data['records'] );
         $offset      = $data['offset'] ?? null;
 
-        if ( ! isset( $query_args['offset'] ) ) { // first page of the fetch
-            if ( $new_etag = wp_remote_retrieve_header( $response, 'etag' ) ) {
-                update_option( 'aco_re_tag_allowlist_etag', $new_etag );
-            }
+        if ( $attempt === 1 && $new_etag = wp_remote_retrieve_header( $response, 'etag' ) ) {
+            update_option( 'aco_re_tag_allowlist_etag', $new_etag );
         }
     } while ( $offset && $attempt < 50 );
 
     $new_allowlist = [];
     foreach ( $all_records as $record ) {
-        $name   = $record['fields']['Name']   ?? '';
+        $name   = $record['fields']['Name'] ?? '';
         $status = $record['fields']['Status'] ?? 'Pending';
         if ( '' !== $name ) { $new_allowlist[ $name ] = $status; }
     }
 
-    // Keep the existing filter name for full backward compatibility.
-    set_transient(
-        'aco_re_tag_allowlist',
-        $new_allowlist,
-        (int) apply_filters( 'aco_tag_allowlist_ttl', HOUR_IN_SECONDS )
-    );
+    set_transient( 'aco_re_tag_allowlist', $new_allowlist, (int) apply_filters( 'aco_tag_allowlist_ttl', HOUR_IN_SECONDS ) );
     update_option( 'aco_re_tag_allowlist_last_sync', time() );
     return true;
 }
@@ -645,340 +615,38 @@ function aco_re_purge_old_logs() {
     );
 }
 
-// --- WP-CLI Helpers: Sync Replay & Log Export + Aliases (refined) ---
+// --- WP-CLI Commands ---
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
-
-    if ( ! class_exists( 'ACO_RE_CLI_Media' ) ) :
     class ACO_RE_CLI_Media {
         public function flip( $args, $assoc_args ) {
             $destination = strtolower( $assoc_args['to'] ?? '' );
-
-            if ( ! in_array( $destination, [ 's3', 'wasabi' ], true ) ) {
-                \WP_CLI::error( 'Invalid destination. Please use --to=s3 or --to=wasabi' );
-                return;
-            }
-
+            if ( ! in_array( $destination, [ 's3', 'wasabi' ], true ) ) { WP_CLI::error( 'Invalid destination. Please use --to=s3 or --to=wasabi' ); return; }
             $current_origin = get_option( 'aco_re_active_media_origin', 's3' );
-            if ( $current_origin === $destination ) {
-                \WP_CLI::warning( "Media origin is already set to '$destination'. No change made." );
-                return;
-            }
-
+            if ( $current_origin === $destination ) { WP_CLI::warning( "Media origin is already set to '$destination'. No change made." ); return; }
             if ( 'wasabi' === $destination ) {
-                \WP_CLI::log( 'Running pre-flip safety probe...' );
+                WP_CLI::log( 'Running pre-flip safety probe...' );
                 $health = aco_re_perform_health_probe( 10, true );
-                if ( empty( $health['all_found'] ) ) {
-                    \WP_CLI::error( 'Failover to Wasabi blocked. The mirror is missing recent files. Check rclone sync log.' );
-                    return;
-                }
-                \WP_CLI::log( 'Probe passed. Mirror is healthy.' );
+                if ( ! $health['all_found'] ) { WP_CLI::error( 'Failover to Wasabi blocked. The mirror is missing recent files. Check rclone sync log.' ); return; }
+                WP_CLI::log( 'Probe passed. Mirror is healthy.' );
             }
-
             update_option( 'aco_re_active_media_origin', $destination );
-
-            if ( function_exists( 'litespeed_purge_all' ) ) {
-                litespeed_purge_all();
-                \WP_CLI::log( 'LiteSpeed cache purged.' );
-            }
-
+            if ( function_exists('litespeed_purge_all') ) { litespeed_purge_all(); WP_CLI::log( 'LiteSpeed cache purged.' ); }
             delete_transient( 'aco_mirror_health_probe_results' );
-            \WP_CLI::success( "Flipped active media origin to '$destination'." );
+            WP_CLI::success( "Flipped active media origin to '$destination'." );
         }
     }
-    endif;
-
-    if ( ! class_exists( 'ACO_RE_CLI_Health' ) ) :
     class ACO_RE_CLI_Health {
         public function probe( $args, $assoc_args ) {
-            \WP_CLI::log( 'Probing Wasabi mirror health...' );
+            WP_CLI::log( 'Probing Wasabi mirror health...' );
             $results = aco_re_perform_health_probe( 10, true );
-
-            if ( empty( $results['checked'] ) ) {
-                \WP_CLI::warning( 'No recent offloaded media uploads found to check.' );
-                return;
-            }
-
-            $table_data = array_map(
-                function( $file ) {
-                    return [
-                        'File'   => basename( (string) ( $file['key'] ?? '' ) ),
-                        'Status' => strtoupper( (string) ( $file['status'] ?? '' ) ),
-                        'Code'   => (string) ( $file['code'] ?? 'N/A' ),
-                    ];
-                },
-                (array) ( $results['files'] ?? [] )
-            );
-
-            \WP_CLI\Utils\format_items( 'table', $table_data, [ 'File', 'Status', 'Code' ] );
-
-            if ( ! empty( $results['all_found'] ) ) {
-                \WP_CLI::success( 'Mirror is healthy. All recent uploads were found.' );
-            } else {
-                \WP_CLI::error( 'Mirror health warning. One or more recent uploads are missing or not public.' );
-            }
+            if ( $results['checked'] === 0 ) { WP_CLI::warning( 'No recent offloaded media uploads found to check.' ); return; }
+            $table_data = array_map( function($file) { return [ 'File' => basename( $file['key'] ), 'Status' => strtoupper( $file['status'] ), 'Code' => $file['code'] ?: 'N/A' ]; }, $results['files']);
+            WP_CLI\Utils\format_items( 'table', $table_data, [ 'File', 'Status', 'Code' ] );
+            if ( $results['all_found'] ) { WP_CLI::success( 'Mirror is healthy. All recent uploads were found.' ); } else { WP_CLI::error( 'Mirror health warning. One or more recent uploads are missing or not public.' ); }
         }
     }
-    endif;
-
-    if ( ! class_exists( 'ACO_RE_CLI_Sync' ) ) :
-    class ACO_RE_CLI_Sync {
-        /**
-         * Replay failed sync jobs using payloads embedded in log messages.
-         *
-         * ## OPTIONS
-         *
-         * [--since=<window>]
-         * : Time window (e.g. '24h', '7d', '2025-10-01'). Default '24h'.
-         *
-         * [--limit=<n>]
-         * : Max rows to inspect. Default 500.
-         *
-         * [--with-warnings]
-         * : Include 'warning' rows in addition to failed/error (default is failed|error only).
-         *
-         * [--id=<log_id>]
-         * : Replay a single log row by its numeric id (overrides --since/--limit).
-         *
-         * [--record-id=<recXXXX>]
-         * : Filter by Airtable record id. Useful for a targeted replay.
-         *
-         * [--dry-run]
-         * : Show what would be re-queued without enqueuing.
-         *
-         * ## EXAMPLES
-         *   wp aco sync replay --since=24h
-         *   wp aco sync replay --with-warnings --record-id=recABC123
-         *   wp aco sync replay --id=12345 --dry-run
-         */
-        public function replay( $args, $assoc_args ) {
-            global $wpdb;
-
-            $limit           = isset( $assoc_args['limit'] ) ? max( 1, (int) $assoc_args['limit'] ) : 500;
-            $since_raw       = isset( $assoc_args['since'] ) ? (string) $assoc_args['since'] : '24h';
-            $includeWarnings = isset( $assoc_args['with-warnings'] );
-            $log_id          = isset( $assoc_args['id'] ) ? max( 0, (int) $assoc_args['id'] ) : 0;
-            $record_id_eq    = isset( $assoc_args['record-id'] ) ? sanitize_text_field( (string) $assoc_args['record-id'] ) : '';
-            $dry_run         = isset( $assoc_args['dry-run'] );
-
-            $table    = $wpdb->prefix . 'aco_sync_log';
-            $fields   = 'id, ts, status, record_id, message';
-            $where    = [];
-
-            if ( $log_id > 0 ) {
-                $where[] = $wpdb->prepare( 'id = %d', $log_id );
-            } else {
-                $since_dt = $this->parse_since_to_utc( $since_raw );
-                $where[]  = $wpdb->prepare( 'ts >= %s', $since_dt );
-                $where[]  = $includeWarnings
-                    ? "status IN ('failed','error','warning')"
-                    : "status IN ('failed','error')";
-                if ( $record_id_eq !== '' ) {
-                    $where[] = $wpdb->prepare( 'record_id = %s', $record_id_eq );
-                }
-            }
-
-            $where_sql = $where ? ( 'WHERE ' . implode( ' AND ', $where ) ) : '';
-            $limit_sql = $log_id > 0 ? '' : " LIMIT {$limit}";
-
-            $sql  = "SELECT {$fields} FROM {$table} {$where_sql} ORDER BY id DESC{$limit_sql}";
-            $rows = (array) $wpdb->get_results( $sql, ARRAY_A );
-
-            if ( empty( $rows ) ) {
-                \WP_CLI::warning( 'No candidate log entries found for replay.' );
-                return;
-            }
-
-            $enqueued = 0;
-            $skipped  = 0;
-            $items    = [];
-
-            foreach ( $rows as $r ) {
-                $parsed   = function_exists( 'aco_re_safe_parse_message' ) ? aco_re_safe_parse_message( (string) ( $r['message'] ?? '' ) ) : [];
-                $context  = is_array( $parsed ) ? ( $parsed['context'] ?? [] ) : [];
-                $payload  = is_array( $context ) ? ( $context['payload'] ?? null ) : null;
-
-                if ( is_array( $payload ) && ! empty( $payload ) ) {
-                    if ( $dry_run ) {
-                        $enqueued++;
-                        $items[] = [ 'Log ID' => (int) $r['id'], 'Record' => (string) ( $r['record_id'] ?? '' ), 'Action' => 'WOULD ENQUEUE' ];
-                    } else {
-                        $ok = function_exists( 'aco_re_enqueue_sync_job' ) ? aco_re_enqueue_sync_job( $payload ) : false;
-                        if ( $ok ) {
-                            $enqueued++;
-                            $items[] = [ 'Log ID' => (int) $r['id'], 'Record' => (string) ( $r['record_id'] ?? '' ), 'Action' => 'ENQUEUED' ];
-                            continue;
-                        }
-                        $skipped++;
-                        $items[] = [ 'Log ID' => (int) $r['id'], 'Record' => (string) ( $r['record_id'] ?? '' ), 'Action' => 'ENQUEUE FAILED' ];
-                    }
-                    continue;
-                }
-
-                $skipped++;
-                $items[] = [ 'Log ID' => (int) $r['id'], 'Record' => (string) ( $r['record_id'] ?? '' ), 'Action' => 'SKIPPED (no payload)' ];
-            }
-
-            if ( ! empty( $items ) ) {
-                \WP_CLI\Utils\format_items( 'table', $items, [ 'Log ID', 'Record', 'Action' ] );
-            }
-
-            \WP_CLI::success(
-                sprintf(
-                    'Replay %s. Enqueued: %d, Skipped: %d',
-                    $dry_run ? 'dry-run complete' : 'complete',
-                    $enqueued,
-                    $skipped
-                )
-            );
-        }
-
-        private function parse_since_to_utc( string $since ) : string {
-            $since = trim( $since );
-            $now   = time();
-
-            if ( preg_match( '/^(\d+)\s*h$/i', $since, $m ) ) {
-                $ts = $now - ( (int) $m[1] * HOUR_IN_SECONDS );
-            } elseif ( preg_match( '/^(\d+)\s*d$/i', $since, $m ) ) {
-                $ts = $now - ( (int) $m[1] * DAY_IN_SECONDS );
-            } elseif ( preg_match( '/^\d{4}-\d{2}-\d{2}/', $since ) ) {
-                $ts = strtotime( $since . ' 00:00:00 UTC' ) ?: ( $now - DAY_IN_SECONDS );
-            } else {
-                $ts = $now - DAY_IN_SECONDS;
-            }
-            return gmdate( 'Y-m-d H:i:s', $ts );
-        }
-    }
-    endif;
-
-    if ( ! class_exists( 'ACO_RE_CLI_Log' ) ) :
-    class ACO_RE_CLI_Log {
-        /**
-         * Export sync log entries as CSV or table.
-         *
-         * ## OPTIONS
-         *
-         * [--since=<window>]
-         * : Time window (e.g. '24h', '7d', '2025-10-01'). Default '24h'.
-         *
-         * [--status=<status>]
-         * : Filter by status (success|warning|failed|error). Default: all.
-         *
-         * [--format=<format>]
-         * : Output format (csv|table). Default: csv.
-         *
-         * [--limit=<n>]
-         * : Max rows. Default 5000 (use higher values explicitly if needed).
-         *
-         * [--safe]
-         * : When --format=csv, prefix formula-like cells (CSV injection hardening).
-         *
-         * ## EXAMPLES
-         *   wp aco log export --since=7d --status=failed --format=csv --limit=5000 > sync-log.csv
-         */
-        public function export( $args, $assoc_args ) {
-            global $wpdb;
-
-            $since_raw = isset( $assoc_args['since'] ) ? (string) $assoc_args['since'] : '24h';
-            $format    = isset( $assoc_args['format'] ) ? strtolower( (string) $assoc_args['format'] ) : 'csv';
-            $status_in = isset( $assoc_args['status'] ) ? strtolower( (string) $assoc_args['status'] ) : '';
-            $limit     = isset( $assoc_args['limit'] ) ? max( 1, (int) $assoc_args['limit'] ) : 5000;
-            $safe_csv  = isset( $assoc_args['safe'] );
-
-            $since_dt  = $this->parse_since_to_utc( $since_raw );
-            $table     = $wpdb->prefix . 'aco_sync_log';
-
-            $where = [ $wpdb->prepare( 'ts >= %s', $since_dt ) ];
-            $allowed = [ 'success','warning','failed','error' ];
-            if ( in_array( $status_in, $allowed, true ) ) {
-                $where[] = $wpdb->prepare( 'status = %s', $status_in );
-            }
-
-            $fields = [ 'id','ts','source','record_id','last_modified','action','resource_id','attachment_id','fingerprint','status','attempts','duration_ms','error_code' ];
-            $sql    = "SELECT " . implode( ',', $fields ) . " FROM {$table} WHERE " . implode( ' AND ', $where ) . " ORDER BY id DESC LIMIT {$limit}";
-            $rows   = (array) $wpdb->get_results( $sql, ARRAY_A );
-
-            $format = in_array( $format, [ 'csv','table' ], true ) ? $format : 'csv';
-
-            if ( $format === 'csv' && $safe_csv && function_exists( 'aco_re_csv_safe_cell' ) ) {
-                foreach ( $rows as &$row ) {
-                    foreach ( $row as $k => $v ) {
-                        $row[ $k ] = aco_re_csv_safe_cell( $v );
-                    }
-                }
-                unset( $row );
-            }
-
-            \WP_CLI\Utils\format_items( $format, $rows, $fields );
-        }
-
-        private function parse_since_to_utc( string $since ) : string {
-            $since = trim( $since );
-            $now   = time();
-
-            if ( preg_match( '/^(\d+)\s*h$/i', $since, $m ) ) {
-                $ts = $now - ( (int) $m[1] * HOUR_IN_SECONDS );
-            } elseif ( preg_match( '/^(\d+)\s*d$/i', $since, $m ) ) {
-                $ts = $now - ( (int) $m[1] * DAY_IN_SECONDS );
-            } elseif ( preg_match( '/^\d{4}-\d{2}-\d{2}/', $since ) ) {
-                $ts = strtotime( $since . ' 00:00:00 UTC' ) ?: ( $now - DAY_IN_SECONDS );
-            } else {
-                $ts = $now - DAY_IN_SECONDS;
-            }
-            return gmdate( 'Y-m-d H:i:s', $ts );
-        }
-    }
-    endif;
-
-    // Register canonical commands
-    \WP_CLI::add_command( 'aco media', 'ACO_RE_CLI_Media' );
-    \WP_CLI::add_command( 'aco health', 'ACO_RE_CLI_Health' );
-    \WP_CLI::add_command( 'aco sync', 'ACO_RE_CLI_Sync' );
-    \WP_CLI::add_command( 'aco log',  'ACO_RE_CLI_Log' );
-
-    // Colon aliases to match project docs/spec
-    \WP_CLI::add_command( 'aco sync:replay', function( $args, $assoc_args ) {
-        ( new ACO_RE_CLI_Sync() )->replay( $args, $assoc_args );
-    } );
-    \WP_CLI::add_command( 'aco log:export', function( $args, $assoc_args ) {
-        ( new ACO_RE_CLI_Log() )->export( $args, $assoc_args );
-    } );
-    \WP_CLI::add_command( 'aco media:flip', function( $args, $assoc_args ) {
-        ( new ACO_RE_CLI_Media() )->flip( $args, $assoc_args );
-    } );
-
-    \WP_CLI::add_command( 'aco health:probe', function( $args, $assoc_args ) {
-        // Delegate to the canonical implementation when using default count (avoids drift).
-        $count = isset( $assoc_args['count'] ) ? max( 1, (int) $assoc_args['count'] ) : 10;
-
-        if ( $count === 10 && class_exists( 'ACO_RE_CLI_Health' ) && method_exists( 'ACO_RE_CLI_Health', 'probe' ) ) {
-            ( new ACO_RE_CLI_Health() )->probe( $args, $assoc_args );
-            return;
-        }
-
-        \WP_CLI::log( 'Probing Wasabi mirror health...' );
-        $results = function_exists( 'aco_re_perform_health_probe' ) ? aco_re_perform_health_probe( $count, true ) : [ 'checked' => 0, 'all_found' => false, 'files' => [] ];
-
-        if ( $results['checked'] === 0 ) {
-            \WP_CLI::warning( 'No recent offloaded media uploads found to check.' );
-            return;
-        }
-
-        $table_data = array_map( function( $file ) {
-            return [
-                'File'   => basename( (string) ( $file['key'] ?? '' ) ),
-                'Status' => strtoupper( (string) ( $file['status'] ?? 'unknown' ) ),
-                'Code'   => (string) ( $file['code'] ?? 'N/A' ),
-            ];
-        }, (array) $results['files'] );
-
-        \WP_CLI\Utils\format_items( 'table', $table_data, [ 'File', 'Status', 'Code' ] );
-
-        if ( ! empty( $results['all_found'] ) ) {
-            \WP_CLI::success( 'Mirror is healthy. All recent uploads were found.' );
-        } else {
-            \WP_CLI::error( 'Mirror health warning. One or more recent uploads are missing or not public.' );
-        }
-    } );
+    WP_CLI::add_command( 'aco media', 'ACO_RE_CLI_Media' );
+    WP_CLI::add_command( 'aco health', 'ACO_RE_CLI_Health' );
 }
 
 // --- Webhook & Sync Processing ---
@@ -994,9 +662,19 @@ function aco_re_get_header( WP_REST_Request $request, $base_key ) {
 }
 
 function aco_re_get_webhook_secrets() {
-    $primary   = _aco_re_get_config( 'ACO_WEBHOOK_SECRET_PRIMARY' );
-    $secondary = _aco_re_get_config( 'ACO_WEBHOOK_SECRET_SECONDARY' );
-    return [ $primary, $secondary ];
+    $primary   = getenv( 'ACO_WEBHOOK_SECRET_PRIMARY' );
+    $secondary = getenv( 'ACO_WEBHOOK_SECRET_SECONDARY' );
+    if ( ! $primary && defined( 'ACO_WEBHOOK_SECRET_PRIMARY' ) ) { $primary = ACO_WEBHOOK_SECRET_PRIMARY; }
+    if ( ! $secondary && defined( 'ACO_WEBHOOK_SECRET_SECONDARY' ) ) { $secondary = ACO_WEBHOOK_SECRET_SECONDARY; }
+    if ( ! $primary ) {
+        $opt = get_option( 'aco_webhook_secret_primary' );
+        if ( is_string( $opt ) && $opt !== '' ) { $primary = $opt; }
+    }
+    if ( ! $secondary ) {
+        $opt = get_option( 'aco_webhook_secret_secondary' );
+        if ( is_string( $opt ) && $opt !== '' ) { $secondary = $opt; }
+    }
+    return [ $primary ?: null, $secondary ?: null ];
 }
 
 function aco_re_decode_signature_to_binary( $sig_raw ) {
@@ -1240,8 +918,7 @@ function aco_re_log( string $level, string $message, array $context = [] ): void
         'record_id'     => isset( $context['record_id'] ) ? (string) $context['record_id'] : null,
         'last_modified' => isset( $context['raw_last_modified'] ) ? (string) $context['raw_last_modified'] : null,
         'action'        => isset( $context['action'] ) ? (string) $context['action'] : null,
-        'resource_id'   => isset( $context['resource_id'] ) ? (int) $context['resource_id']
-                    : ( isset( $context['post_id'] ) ? (int) $context['post_id'] : null ),
+        'resource_id'   => isset( $context['post_id'] ) ? (int) $context['post_id'] : null,
         'attachment_id' => isset( $context['attachment_id'] ) ? (int) $context['attachment_id'] : null,
         'fingerprint'   => isset( $context['fingerprint'] ) ? substr( (string) $context['fingerprint'], 0, 255 ) : null,
         'status'        => $status,
@@ -1280,339 +957,34 @@ function aco_re_log( string $level, string $message, array $context = [] ): void
 }
 
 /**
- * Validate a file source and perform a HEAD pre-flight.
- * Enforces https scheme, allowed host(s), allowed MIME(s), and a max size.
- */
-function aco_re_preflight_remote_file( string $file_url ) {
-    $url = esc_url_raw( $file_url );
-    $parts = wp_parse_url( $url );
-    if ( empty( $parts['scheme'] ) || strtolower( $parts['scheme'] ) !== 'https' ) {
-        return new WP_Error( 'bad_scheme', 'Only HTTPS sources are allowed.' );
-    }
-    $host = strtolower( $parts['host'] ?? '' );
-    // Allow-list: default empty means allow any host; override via filter.
-    $allowed_hosts = (array) apply_filters( 'aco_re_allowed_file_hosts', [] );
-    if ( $allowed_hosts && ! in_array( $host, array_map( 'strtolower', $allowed_hosts ), true ) ) {
-        return new WP_Error( 'host_not_allowed', 'Source host is not allow-listed.' );
-    }
-
-    $head = wp_remote_head( $url, [ 'timeout' => 10, 'redirection' => 2 ] );
-    if ( is_wp_error( $head ) ) {
-        return $head;
-    }
-    $code = (int) wp_remote_retrieve_response_code( $head );
-    if ( $code < 200 || $code >= 300 ) {
-        return new WP_Error( 'head_failed', 'HEAD request failed with HTTP ' . $code );
-    }
-
-    $ctype = strtolower( (string) wp_remote_retrieve_header( $head, 'content-type' ) );
-    $allowed_mimes = (array) apply_filters( 'aco_re_allowed_mime_types', [ 'application/pdf' ] );
-    $ok_mime = false;
-    foreach ( $allowed_mimes as $mime ) {
-        if ( $ctype && strpos( $ctype, strtolower( $mime ) ) !== false ) { $ok_mime = true; break; }
-    }
-    if ( ! $ok_mime ) {
-        return new WP_Error( 'bad_mime', 'Remote file type is not permitted.' );
-    }
-
-    $len = (int) wp_remote_retrieve_header( $head, 'content-length' );
-    $max_bytes = (int) apply_filters( 'aco_re_max_sideload_bytes', 50 * 1024 * 1024 ); // 50 MB default
-    if ( $len > 0 && $len > $max_bytes ) {
-        return new WP_Error( 'too_large', 'Remote file exceeds the permitted size.' );
-    }
-
-    return [
-        'content_type'   => $ctype,
-        'content_length' => $len,
-        'url'            => $url,
-        'host'           => $host,
-        'parts'          => $parts,
-    ];
-}
-
-/**
- * Try to resolve an existing attachment for our own media URLs (primary or mirror),
- * avoiding re-uploading duplicates.
- */
-function aco_re_try_resolve_existing_attachment_from_url( string $file_url ) {
-    $parts = wp_parse_url( $file_url );
-    if ( empty( $parts['host'] ) || empty( $parts['path'] ) ) {
-        return 0;
-    }
-
-    $primary_host = apply_filters( 'aco_re_primary_media_host', 'media.acomain.site' );
-    $mirror_host  = apply_filters( 'aco_re_failover_media_host', 'aco-media-production-mirror.s3.eu-west-1.wasabisys.com' );
-    $host = strtolower( $parts['host'] );
-
-    if ( strtolower( $primary_host ) !== $host && strtolower( $mirror_host ) !== $host ) {
-        return 0; // Not our infra → cannot resolve by key.
-    }
-
-    $key = ltrim( (string) $parts['path'], '/' );
-
-    global $wpdb;
-    $table = $wpdb->prefix . 'as3cf_items';
-    if ( ! function_exists( 'aco_re_table_exists_strict' ) || ! aco_re_table_exists_strict( $table ) ) {
-        return 0;
-    }
-
-    // Look up the attachment by the exact offload key (path).
-    $attachment_id = (int) $wpdb->get_var(
-        $wpdb->prepare( "SELECT source_id FROM {$table} WHERE path = %s LIMIT 1", $key )
-    );
-
-    return $attachment_id > 0 ? $attachment_id : 0;
-}
-
-/**
- * Wait briefly for Offload Media to record bucket/path for a new attachment.
- */
-function aco_re_get_offload_info_with_retry( int $attachment_id, int $attempts = 5, int $sleep_ms = 500 ) {
-    global $wpdb;
-    $table = $wpdb->prefix . 'as3cf_items';
-    if ( ! function_exists( 'aco_re_table_exists_strict' ) || ! aco_re_table_exists_strict( $table ) ) {
-        return null;
-    }
-    for ( $i = 0; $i < max( 1, $attempts ); $i++ ) {
-        $row = $wpdb->get_row(
-            $wpdb->prepare(
-                "SELECT bucket, path FROM {$table} WHERE source_id = %d AND source_type IN ('media','media-library') LIMIT 1",
-                $attachment_id
-            ),
-            ARRAY_A
-        );
-        if ( $row && ! empty( $row['bucket'] ) && ! empty( $row['path'] ) ) {
-            return $row;
-        }
-        // Sleep between attempts.
-        if ( $i < $attempts - 1 ) {
-            usleep( max( 0, $sleep_ms ) * 1000 );
-        }
-    }
-    return null;
-}
-
-/**
- * Handle a cleared FileURL (remove association).
- */
-function aco_re_clear_primary_attachment( int $post_id ) {
-    delete_post_meta( $post_id, '_aco_primary_attachment_id' );
-    delete_post_meta( $post_id, '_aco_file_fingerprint' );
-}
-
-
-/**
- * Enhanced helper: validates, de-dupes, sideloads (only when needed), and fingerprints.
- */
-function _aco_re_sideload_and_attach_file( int $post_id, string $file_url ) {
-    // 1) Pre-flight validation (scheme/host/MIME/size)
-    $pre = aco_re_preflight_remote_file( $file_url );
-    if ( is_wp_error( $pre ) ) {
-        return $pre;
-    }
-    $pre = is_array( $pre ) ? $pre : [];
-
-    // 2) Shortcut: if this URL is already under our media domain(s), reuse existing attachment.
-    $existing_id = aco_re_try_resolve_existing_attachment_from_url( $file_url );
-    if ( $existing_id > 0 ) {
-        update_post_meta( $post_id, '_aco_primary_attachment_id', $existing_id );
-
-        // Compute fingerprint from Offload table.
-        $off = aco_re_get_offload_info_with_retry( $existing_id );
-        if ( $off ) {
-            $filesize = 0;
-            $meta = wp_get_attachment_metadata( $existing_id );
-            if ( is_array( $meta ) && ! empty( $meta['filesize'] ) ) {
-                $filesize = (int) $meta['filesize'];
-            }
-            if ( ! $filesize ) {
-                $filepath = get_attached_file( $existing_id );
-                if ( $filepath && file_exists( $filepath ) ) {
-                    $filesize = (int) filesize( $filepath );
-                } elseif ( ! empty( $pre['content_length'] ) ) {
-                    $filesize = (int) $pre['content_length'];
-                }
-            }
-            if ( $filesize ) {
-                $fingerprint = sprintf( 's3:%s:%s|%d', $off['bucket'], ltrim( (string) $off['path'], '/' ), $filesize );
-                update_post_meta( $post_id, '_aco_file_fingerprint', $fingerprint );
-            }
-        }
-
-        aco_re_log( 'info', 'Reused existing attachment for media-domain URL.', [
-            'post_id'       => $post_id,
-            'attachment_id' => $existing_id,
-            'action'        => 'file_reuse',
-            'fingerprint'   => get_post_meta( $post_id, '_aco_file_fingerprint', true ),
-            'payload'       => [ 'FileURL' => $file_url ],
-        ] );
-        return true;
-    }
-
-    // 3) Sideload (external source)
-    if ( ! function_exists( 'media_handle_sideload' ) ) {
-        require_once ABSPATH . 'wp-admin/includes/media.php';
-        require_once ABSPATH . 'wp-admin/includes/file.php';
-        require_once ABSPATH . 'wp-admin/includes/image.php';
-    }
-
-    $tmp = download_url( $file_url, 30 ); // honour WP HTTP settings; 30s safeguard
-    if ( is_wp_error( $tmp ) ) {
-        return $tmp;
-    }
-
-    $file_array = [
-        'name'     => basename( wp_parse_url( $file_url, PHP_URL_PATH ) ) ?: 'document.pdf',
-        'tmp_name' => $tmp,
-    ];
-
-    $attachment_id = media_handle_sideload( $file_array, $post_id );
-    if ( is_wp_error( $attachment_id ) ) {
-        @unlink( $file_array['tmp_name'] );
-        return $attachment_id;
-    }
-
-    update_post_meta( $post_id, '_aco_primary_attachment_id', $attachment_id );
-
-    // START: Patch to parent the attachment and trigger re-index
-    $parent_result = wp_update_post(
-        [ 'ID' => (int) $attachment_id, 'post_parent' => (int) $post_id ],
-        true
-    );
-    if ( is_wp_error( $parent_result ) ) {
-        aco_re_log('warning', 'Could not parent attachment to Resource.', [
-            'post_id'       => (int) $post_id,
-            'attachment_id' => (int) $attachment_id,
-            'action'        => 'file_parent',
-            'error'         => $parent_result->get_error_message(),
-        ]);
-    } else {
-        // If SearchWP is present, enqueue a reindex of the Resource so PDF content attribution updates.
-        if ( has_action( 'searchwp\\index\\enqueue' ) ) {
-            do_action( 'searchwp\\index\\enqueue', 'post', (int) $post_id );
-        }
-    }
-    // END: Patch
-
-    // 4) Compute fingerprint (with small retry for Offload row)
-    $off = aco_re_get_offload_info_with_retry( $attachment_id );
-    if ( ! $off ) {
-        return new WP_Error( 'fingerprint_failed', 'Could not retrieve offload info to generate fingerprint.' );
-    }
-
-    $filesize = 0;
-    $filepath = get_attached_file( $attachment_id );
-    if ( $filepath && file_exists( $filepath ) ) {
-        $filesize = (int) filesize( $filepath );
-    }
-    if ( ! $filesize ) {
-        $meta = wp_get_attachment_metadata( $attachment_id );
-        if ( is_array( $meta ) && ! empty( $meta['filesize'] ) ) {
-            $filesize = (int) $meta['filesize'];
-        }
-    }
-    if ( ! $filesize && ! empty( $pre['content_length'] ) ) {
-        $filesize = (int) $pre['content_length'];
-    }
-
-    if ( ! $filesize ) {
-        return new WP_Error( 'fingerprint_failed', 'Could not determine attachment size for fingerprint.' );
-    }
-
-    $fingerprint = sprintf( 's3:%s:%s|%d', $off['bucket'], ltrim( (string) $off['path'], '/' ), $filesize );
-    update_post_meta( $post_id, '_aco_file_fingerprint', $fingerprint );
-
-    aco_re_log( 'info', 'Sideloaded and fingerprinted file.', [
-        'post_id'       => $post_id,
-        'attachment_id' => $attachment_id,
-        'fingerprint'   => $fingerprint,
-        'action'        => 'file_sideload',
-        'payload'       => [ 'FileURL' => $file_url ],
-    ] );
-
-    return true;
-}
-
-/**
- * Deterministic term setter:
- * - Resolves each term by name with get_term_by() to avoid get_terms() filters.
- * - Enforces allow-list (when requested).
- * - Replaces terms atomically by clearing first, then setting exactly the resolved IDs.
- */
-function _aco_re_set_post_terms_from_names( int $post_id, string $taxonomy, array $names, array $log_ctx, bool $enforce_allowlist = false ): void {
-    // Defensive
-    if ( ! taxonomy_exists( $taxonomy ) ) {
-        $ctx = $log_ctx; $ctx['taxonomy'] = $taxonomy;
-        aco_re_log( 'error', sprintf( 'Taxonomy "%s" does not exist; cannot set terms.', $taxonomy ), $ctx );
-        return;
-    }
-
-    // Normalise
-    $names = array_values( array_unique( array_filter( array_map(
-        static function( $n ) { return trim( (string) $n ); },
-        (array) $names
-    ) ) ) );
-
-    // Allow-list enforcement for universal_tag
-    if ( $enforce_allowlist && ! empty( $names ) ) {
-        $violations = aco_re_get_tag_violations( $names ); // uses names
-        if ( ! empty( $violations ) ) {
-            $ctx = $log_ctx; $ctx['taxonomy'] = $taxonomy; $ctx['violations'] = $violations;
-            aco_re_log( 'warning', sprintf( 'Rejected non-approved term(s) for "%s": %s', $taxonomy, implode( ', ', $violations ) ), $ctx );
-            $names = array_values( array_diff( $names, $violations ) );
-        }
-    }
-
-    // If empty after validation → clear all and finish
-    if ( empty( $names ) ) {
-        wp_set_object_terms( $post_id, [], $taxonomy );
-        return;
-    }
-
-    // Resolve by name (not via get_terms) to avoid filter-driven widening
-    $term_ids  = [];
-    $not_found = [];
-    foreach ( $names as $name ) {
-        $term = get_term_by( 'name', $name, $taxonomy );
-        if ( $term && ! is_wp_error( $term ) ) {
-            $term_ids[] = (int) $term->term_id;
-        } else {
-            $not_found[] = $name;
-        }
-    }
-
-    if ( $not_found ) {
-        $ctx = $log_ctx; $ctx['taxonomy'] = $taxonomy; $ctx['not_found'] = $not_found;
-        aco_re_log( 'warning', sprintf( 'The following term name(s) were not found for "%s": %s', $taxonomy, implode( ', ', $not_found ) ), $ctx );
-    }
-
-    // Hard replace: clear first, then set exactly the resolved IDs (if any)
-    wp_set_object_terms( $post_id, [], $taxonomy );
-    if ( $term_ids ) {
-        wp_set_object_terms( $post_id, $term_ids, $taxonomy, false );
-    }
-}
-
-/**
  * Processes a single resource sync job from the Action Scheduler queue.
  *
  * @param array|string $payload The data received from the Airtable webhook (array or JSON string).
  * @return array Outcome summary for observability: ['status' => 'created|updated|skipped|error', 'post_id' => int|null, 'reason' => string|null]
  */
 function aco_re_process_resource_sync_action( $payload ) {
+    // 0. Decode JSON if a string payload is provided.
     if ( is_string( $payload ) ) {
         $decoded = json_decode( $payload, true );
         if ( json_last_error() === JSON_ERROR_NONE && is_array( $decoded ) ) {
             $payload = $decoded;
         }
     }
-    $data = ( is_array( $payload ) && isset( $payload['payload'] ) && is_array( $payload['payload'] ) ) ? $payload['payload'] : ( is_array( $payload ) ? $payload : [] );
+
+    // 1. Normalize the incoming data.
+    $data = ( is_array( $payload ) && isset( $payload['payload'] ) && is_array( $payload['payload'] ) )
+        ? $payload['payload']
+        : ( is_array( $payload ) ? $payload : [] );
+
+    // 1a. Validate post type availability early.
     if ( ! post_type_exists( 'resource' ) ) {
         aco_re_log( 'error', 'Post type "resource" is not registered.' );
         return [ 'status' => 'error', 'post_id' => null, 'reason' => 'post_type_missing' ];
     }
-    $raw_record_id = $data['record_id'] ?? '';
-    $raw_last_modified = $data['LastModified'] ?? '';
+
+    // 2. Validate required fields.
+    $raw_record_id      = $data['record_id']    ?? '';
+    $raw_last_modified  = $data['LastModified'] ?? '';
     $record_id = sanitize_text_field( (string) $raw_record_id );
     list( $incoming_ms, $incoming_iso ) = aco_re_parse_last_modified( $raw_last_modified );
 
@@ -1620,83 +992,108 @@ function aco_re_process_resource_sync_action( $payload ) {
         aco_re_log( 'error', 'Payload missing valid record_id or LastModified.', [ 'has_record_id' => $record_id !== '', 'raw_last_modified' => is_string( $raw_last_modified ) ? $raw_last_modified : null, 'action' => 'validation' ] );
         return [ 'status' => 'error', 'post_id' => null, 'reason' => 'invalid_payload' ];
     }
+
+    // 3. Concurrency lock per record.
     if ( ! aco_re_acquire_lock( $record_id, 120 ) ) {
         aco_re_log( 'warning', 'Lock present, skipping concurrent job.', [ 'record_id' => $record_id, 'action' => 'lock' ] );
         return [ 'status' => 'skipped', 'post_id' => null, 'reason' => 'locked' ];
     }
-    try {
-        $post_id = aco_re_get_post_id_by_record_id( $record_id );
-        $action = 'update';
 
-        if ( $post_id ) { // --- UPDATE PATH ---
+    try {
+        // 4. Lookup post by Airtable record_id.
+        $post_id = aco_re_get_post_id_by_record_id( $record_id );
+        $action = 'update'; // Default action for logging
+
+        if ( $post_id ) {
+            // UPDATE path
             $stored_ms = (int) get_post_meta( $post_id, ACO_AT_LAST_MODIFIED_MS_META, true );
             if ( ! $stored_ms ) {
                 $stored_iso_legacy = (string) get_post_meta( $post_id, ACO_AT_LAST_MODIFIED_META, true );
-                if ( $stored_iso_legacy ) { list( $stored_ms_from_iso ) = aco_re_parse_last_modified( $stored_iso_legacy ); $stored_ms = (int) $stored_ms_from_iso; }
+                if ( $stored_iso_legacy ) {
+                    list( $stored_ms_from_iso ) = aco_re_parse_last_modified( $stored_iso_legacy );
+                    $stored_ms = (int) $stored_ms_from_iso;
+                }
             }
+
             if ( $incoming_ms <= $stored_ms ) {
                 aco_re_log( 'info', 'SKIP stale update.', [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => 'skip' ] );
                 return [ 'status' => 'skipped', 'post_id' => $post_id, 'reason' => 'stale' ];
             }
+
             $update = [ 'ID' => $post_id ];
-            if ( isset( $data['Title'] ) ) { $update['post_title'] = wp_strip_all_tags( $data['Title'] ); }
-            if ( count( $update ) > 1 ) { wp_update_post( wp_slash( $update ), true, false ); }
+            if ( isset($data['Title']) ) { $update['post_title'] = wp_strip_all_tags( $data['Title'] ); }
+
+            if ( count( $update ) > 1 ) {
+                wp_update_post( wp_slash( $update ), true, false );
+            }
             
-        } else { // --- CREATE PATH ---
+            update_post_meta( $post_id, '_aco_summary', isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '' );
+            update_post_meta( $post_id, '_aco_document_date', ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '' );
+
+            update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_META, $incoming_iso );
+            update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_MS_META, $incoming_ms );
+
+        } else {
+            // CREATE path
             $action = 'create';
-            $title = $data['Title'] ?? 'Resource ' . $record_id;
+            $title   = $data['Title'] ?? 'Resource ' . $record_id;
             $content = $data['Content'] ?? '';
-            $insert = [ 'post_type' => 'resource', 'post_status' => 'publish', 'post_title' => wp_strip_all_tags( $title ), 'post_content' => wp_kses_post( $content ) ];
+            
+            $meta_input = [
+                ACO_AT_RECORD_ID_META        => $record_id,
+                ACO_AT_LAST_MODIFIED_META    => $incoming_iso,
+                ACO_AT_LAST_MODIFIED_MS_META => $incoming_ms,
+                '_aco_summary'               => isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '',
+                '_aco_document_date'         => ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '',
+            ];
+
+            $insert = [
+                'post_type'    => 'resource',
+                'post_status'  => 'publish',
+                'post_title'   => wp_strip_all_tags( $title ),
+                'post_content' => wp_kses_post( $content ),
+                'meta_input'   => $meta_input,
+            ];
+
             $post_id = wp_insert_post( wp_slash( $insert ), true );
             if ( is_wp_error( $post_id ) ) {
                 aco_re_log( 'error', 'Create failed.', [ 'record_id' => $record_id, 'error' => $post_id->get_error_message(), 'action' => 'create' ] );
                 return [ 'status' => 'error', 'post_id' => null, 'reason' => 'create_failed' ];
             }
         }
-
-        if ( is_wp_error( $post_id ) || ! ( $post_id > 0 ) ) {
-             // This case should be caught by the create path error, but as a safeguard:
-            aco_re_log( 'error', 'Invalid post ID after create/update.', [ 'record_id' => $record_id, 'action' => $action ] );
-            return [ 'status' => 'error', 'post_id' => null, 'reason' => 'invalid_post_id' ];
-        }
-
-        // --- COMMON LOGIC FOR BOTH CREATE AND UPDATE ---
-        // Meta fields
-        update_post_meta( $post_id, ACO_AT_RECORD_ID_META, $record_id ); // Ensure this is always set
-        update_post_meta( $post_id, '_aco_summary', isset( $data['Summary'] ) ? sanitize_textarea_field( $data['Summary'] ) : '' );
-        update_post_meta( $post_id, '_aco_document_date', ( isset( $data['DocumentDate'] ) && preg_match( '/^\d{4}-\d{2}-\d{2}$/', $data['DocumentDate'] ) ) ? $data['DocumentDate'] : '' );
-        update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_META, $incoming_iso );
-        update_post_meta( $post_id, ACO_AT_LAST_MODIFIED_MS_META, $incoming_ms );
-
-        // Taxonomy fields
-        $log_ctx = [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'action' => $action ];
-        $type_names = ( ! empty( $data['Type'] ) && is_string( $data['Type'] ) ) ? [ $data['Type'] ] : [];
-        _aco_re_set_post_terms_from_names( (int) $post_id, 'resource_type', $type_names, $log_ctx, false );
-        $tag_names = ( ! empty( $data['Tags'] ) && is_array( $data['Tags'] ) ) ? $data['Tags'] : [];
-        _aco_re_set_post_terms_from_names( (int) $post_id, 'universal_tag', $tag_names, $log_ctx, true );
-
-        // File handling
-        if ( array_key_exists( 'FileURL', $data ) ) {
-            $file_url = is_string( $data['FileURL'] ) ? trim( $data['FileURL'] ) : '';
-            if ( $file_url !== '' ) {
-                $file_result = _aco_re_sideload_and_attach_file( (int) $post_id, $file_url );
-                if ( is_wp_error( $file_result ) ) {
-                    $log_ctx['error']   = $file_result->get_error_message();
-                    $log_ctx['payload'] = [ 'FileURL' => $file_url ];
-                    aco_re_log( 'warning', 'File handling failed.', $log_ctx );
+        
+        // --- START: HANDLE TAXONOMIES ---
+        if ( ! is_wp_error( $post_id ) && $post_id > 0 ) {
+            // Handle Type Taxonomy
+            if ( ! empty( $data['Type'] ) ) {
+                $type_term = get_term_by( 'name', $data['Type'], 'resource_type' );
+                if ( $type_term ) {
+                    wp_set_object_terms( $post_id, $type_term->term_id, 'resource_type' );
+                } else {
+                    aco_re_log( 'warning', "Resource Type '{$data['Type']}' not found.", [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => $action ] );
                 }
             } else {
-                aco_re_clear_primary_attachment( (int) $post_id );
-                aco_re_log( 'info', 'Cleared primary attachment due to empty FileURL.', [ 'record_id' => $record_id, 'post_id'   => (int) $post_id, 'action' => 'file_clear' ] );
+                wp_set_object_terms( $post_id, [], 'resource_type' ); // Clear if empty
+            }
+
+            // Handle Tags Taxonomy
+            if ( ! empty( $data['Tags'] ) && is_array( $data['Tags'] ) ) {
+                $tag_ids = [];
+                foreach ( $data['Tags'] as $tag_name ) {
+                    $tag_term = get_term_by( 'name', $tag_name, 'universal_tag' );
+                    if ( $tag_term ) {
+                        $tag_ids[] = $tag_term->term_id;
+                    } else {
+                        aco_re_log( 'warning', "Universal Tag '{$tag_name}' not found.", [ 'record_id' => $record_id, 'post_id' => $post_id, 'action' => $action ] );
+                    }
+                }
+                wp_set_object_terms( $post_id, $tag_ids, 'universal_tag' );
+            } else {
+                wp_set_object_terms( $post_id, [], 'universal_tag' ); // Clear if empty
             }
         }
-        
-        // --- Enqueue SearchWP reindex on successful upsert ---
-        if ( has_action( 'searchwp\\index\\enqueue' ) && $post_id ) {
-            do_action( 'searchwp\\index\\enqueue', 'post', (int) $post_id );
-        }
+        // --- END: HANDLE TAXONOMIES ---
 
-        // --- LOG FINAL STATUS ---
         if ( $action === 'create' ) {
             aco_re_log( 'info', 'ACCEPTED CREATE.', [ 'record_id' => $record_id, 'post_id' => (int) $post_id, 'action' => 'create' ] );
             return [ 'status' => 'created', 'post_id' => (int) $post_id, 'reason' => null ];
@@ -1712,357 +1109,17 @@ function aco_re_process_resource_sync_action( $payload ) {
         aco_re_release_lock( $record_id );
     }
 }
-
-
-// --- Nightly Delta Sync (Spec-aligned, safe) ---
-// Requires env vars per Implementation Spec v1 §3: ACO_AT_API_KEY, ACO_AT_BASE_ID, ACO_AT_TABLE_RESOURCES.
-
-/**
- * Central helper to retrieve configuration values.
- * It checks for a defined constant first, then falls back to an environment variable.
- */
-function _aco_re_get_config( string $key ) {
-    // Prefer constants defined in wp-config.php
-    if ( defined( $key ) ) {
-        $val = constant( $key );
-        if ( $val !== null && $val !== '' ) {
-            return $val;
-        }
-    }
-    // Fallbacks for environments where getenv() may be empty under WP-CLI wrappers
-    foreach ( [ $_ENV, $_SERVER ] as $src ) {
-        if ( isset( $src[ $key ] ) && $src[ $key ] !== '' ) {
-            return $src[ $key ];
-        }
-    }
-    $env = getenv( $key );
-    return ( $env !== false && $env !== '' ) ? $env : null;
-}
-
-/**
- * Small Airtable helper for making GET requests (Patched to use _aco_re_get_config).
- */
-function _aco_re_airtable_get( string $table_id, array $query = [] ) {
-    $api_key = _aco_re_get_config( 'ACO_AT_API_KEY' );
-    $base_id = _aco_re_get_config( 'ACO_AT_BASE_ID' );
-    if ( ! $api_key || ! $base_id || ! $table_id ) {
-        return new WP_Error( 'aco_re_missing_creds', 'Airtable API credentials are not configured.' );
-    }
-
-    $endpoint = "https://api.airtable.com/v0/{$base_id}/{$table_id}";
-    $url      = add_query_arg( $query, $endpoint );
-
-    $args = [
-        'headers'     => [
-            'Authorization' => 'Bearer ' . $api_key,
-            'Accept'        => 'application/json',
-        ],
-        'timeout'     => 20,
-        'redirection' => 3,
-    ];
-
-    $res = wp_remote_get( $url, $args );
-    if ( is_wp_error( $res ) ) {
-        return $res;
-    }
-
-    $code = (int) wp_remote_retrieve_response_code( $res );
-    $body = (string) wp_remote_retrieve_body( $res );
-
-    if ( 200 !== $code ) {
-        $snippet = mb_substr( trim( $body ), 0, 300 );
-        return new WP_Error( 'aco_re_api_error', sprintf( 'Airtable API error %d: %s', $code, $snippet ) );
-    }
-
-    $data = json_decode( $body, true );
-    if ( ! is_array( $data ) ) {
-        return new WP_Error( 'aco_re_bad_json', 'Invalid JSON from Airtable.' );
-    }
-
-    return $data;
-}
-
-/**
- * Main orchestrator for the nightly sync cron job.
- */
-function aco_re_run_nightly_delta_sync() {
-    $start_ts = time();
-    $sync_id  = uniqid('sync_', true);
-    $summary  = [
-        'enqueued_upserts' => 0,
-        'deleted'          => 0,
-        'errors'           => [],
-        'start_time'       => gmdate('c', $start_ts),
-        'end_time'         => '',
-        'duration_s'       => 0,
-    ];
-
-    aco_re_log( 'info', 'Nightly sync started.', [ 'source' => 'nightly', 'sync_id' => $sync_id ] );
-
-    try {
-        $upserts = _aco_re_nightly_sync_upserts( $sync_id );
-        if ( is_wp_error( $upserts ) ) { throw new Exception( $upserts->get_error_message() ); }
-        $summary['enqueued_upserts'] = (int) $upserts['enqueued'];
-
-        $deletes = _aco_re_nightly_sync_deletes( $sync_id );
-        if ( is_wp_error( $deletes ) ) { throw new Exception( $deletes->get_error_message() ); }
-        $summary['deleted'] = (int) $deletes['deleted'];
-
-        update_option( 'aco_re_nightly_sync_cursor', $summary['start_time'] );
-        aco_re_log( 'info', 'Nightly sync completed.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'summary' => $summary ] );
-
-    } catch ( Throwable $e ) {
-        $summary['errors'][] = $e->getMessage();
-        aco_re_log( 'error', 'Nightly sync failed: ' . $e->getMessage(), [ 'source' => 'nightly', 'sync_id' => $sync_id, 'exception' => $e->getMessage() ] );
-    }
-
-    $summary['end_time']   = gmdate( 'c' );
-    $summary['duration_s'] = max( 0, time() - $start_ts );
-    _aco_re_nightly_sync_send_summary_email( $summary );
-}
-
-/**
- * Stage 1: Fetches new/updated records and enqueues them for processing.
- */
-function _aco_re_nightly_sync_upserts( string $sync_id ) {
-    $table_id = _aco_re_get_config( 'ACO_AT_TABLE_RESOURCES' );
-    if ( ! $table_id ) {
-        return new WP_Error( 'aco_re_missing_table', 'ACO_AT_TABLE_RESOURCES is not configured.' );
-    }
-
-    $cursor_iso = get_option( 'aco_re_nightly_sync_cursor', '' );
-    if ( empty( $cursor_iso ) ) {
-        $cursor_iso = gmdate( 'c', time() - DAY_IN_SECONDS );
-    }
-
-    // Schema-agnostic: filter by computed LAST_MODIFIED_TIME() and do NOT restrict fields.
-    $query  = [
-        'pageSize'        => 100,
-        'filterByFormula' => sprintf( 'IS_AFTER(LAST_MODIFIED_TIME(), "%s")', $cursor_iso ),
-        // Intentionally no 'fields' param to avoid 422 when names differ.
-    ];
-
-    $enqueued  = 0;
-    $guard_max = (int) apply_filters( 'aco_re_nightly_sync_max_items', 5000 );
-    $seen      = 0;
-    $offset    = null;
-
-    do {
-        if ( $offset ) {
-            $query['offset'] = $offset;
-        } else {
-            unset( $query['offset'] );
-        }
-
-        $data = _aco_re_airtable_get( $table_id, $query );
-        if ( is_wp_error( $data ) ) {
-            return $data;
-        }
-
-        $records = ( isset( $data['records'] ) && is_array( $data['records'] ) ) ? $data['records'] : [];
-        foreach ( $records as $rec ) {
-            if ( empty( $rec['id'] ) || empty( $rec['fields'] ) || ! is_array( $rec['fields'] ) ) {
-                continue;
-            }
-
-            $f = is_array( $rec['fields'] ?? null ) ? $rec['fields'] : [];
-
-            // Robust getters with common fallbacks
-            $title        = aco_re_get_first_string( $f, [ 'Title', 'Name' ] );
-            $summary      = aco_re_get_first_string( $f, [ 'Summary', 'Description', 'Notes' ] );
-            $file_url     = aco_re_get_first_string( $f, [ 'FileURL', 'File Url', 'File URL', 'URL' ] );
-            $type_value   = aco_re_get_first_string( $f, [ 'Type', 'Resource Type', 'Types' ] );
-            $documentDate = aco_re_get_first_string( $f, [ 'DocumentDate', 'Document Date', 'Date' ] );
-            $lastModified = aco_re_get_first_string( $f, [ 'LastModified', 'Last Modified', 'Last modified time' ] );
-
-            // Tags can be either an array or a comma-separated string
-            $tags = [];
-            if ( isset( $f['Tags'] ) ) {
-                if ( is_array( $f['Tags'] ) ) {
-                    $tags = array_values( array_filter( array_map( 'strval', $f['Tags'] ) ) );
-                } elseif ( is_string( $f['Tags'] ) ) {
-                    $tags = array_values( array_filter( array_map( 'trim', explode( ',', $f['Tags'] ) ) ) );
-                }
-            }
-
-            // Fallback for last modified (we filtered by LAST_MODIFIED_TIME() already)
-            if ( $lastModified === '' ) {
-                $lastModified = gmdate( 'c' );
-            }
-
-            $payload = [
-                'record_id'    => (string) $rec['id'],
-                'Title'        => (string) $title,
-                'Summary'      => (string) $summary,
-                'FileURL'      => (string) $file_url,
-                'Type'         => (string) $type_value,
-                'DocumentDate' => (string) $documentDate,
-                'LastModified' => (string) $lastModified,
-                'Tags'         => $tags,
-            ];
-
-            if ( aco_re_enqueue_sync_job( $payload ) ) {
-                $enqueued++;
-            }
-        }
-
-        $seen   += count( $records );
-        $offset  = $data['offset'] ?? null;
-
-        if ( $seen >= $guard_max ) {
-            aco_re_log(
-                'warning',
-                'Nightly upserts capped by guard_max.',
-                [ 'source' => 'nightly', 'sync_id' => $sync_id, 'guard_max' => $guard_max ]
-            );
-            break;
-        }
-    } while ( $offset );
-
-    aco_re_log(
-        'info',
-        'Stage 1 (Upserts) completed.',
-        [ 'source' => 'nightly', 'sync_id' => $sync_id, 'enqueued' => $enqueued, 'cursor' => $cursor_iso ]
-    );
-    return [ 'enqueued' => $enqueued ];
-}
-
-/**
- * Stage 2: Finds and soft-deletes WordPress records that are no longer in Airtable.
- */
-function _aco_re_nightly_sync_deletes( string $sync_id ) {
-    global $wpdb;
-    $table_id = _aco_re_get_config( 'ACO_AT_TABLE_RESOURCES' );
-    if ( ! $table_id ) return new WP_Error( 'aco_re_missing_table', 'ACO_AT_TABLE_RESOURCES is not configured.' );
-
-    $airtable_ids = [];
-    // No fields restriction; we only need IDs and want to avoid 422 on unknown field names.
-    $query = [ 'pageSize' => 100 ];
-    $offset = null;
-
-    do {
-        if ( $offset ) { $query['offset'] = $offset; } else { unset( $query['offset'] ); }
-        $data = _aco_re_airtable_get( $table_id, $query );
-        if ( is_wp_error( $data ) ) { return $data; }
-
-        $records = isset( $data['records'] ) && is_array( $data['records'] ) ? $data['records'] : [];
-        foreach ( $records as $rec ) {
-            if ( isset( $rec['id'] ) ) { $airtable_ids[$rec['id']] = true; }
-        }
-        $offset = isset( $data['offset'] ) ? $data['offset'] : null;
-    } while ( $offset );
-
-    if ( empty( $airtable_ids ) ) {
-        aco_re_log( 'warning', 'Stage 2 aborted: Airtable returned zero IDs. No records will be deleted.', [ 'source' => 'nightly', 'sync_id' => $sync_id ] );
-        return [ 'deleted' => 0 ];
-    }
-
-    $wp_map = [];
-    $batch  = 2000;
-    $last_id = 0;
-
-    do {
-        $rows = $wpdb->get_results(
-            $wpdb->prepare(
-                "SELECT pm.post_id, pm.meta_value AS record_id
-                 FROM {$wpdb->postmeta} pm
-                 WHERE pm.meta_key = %s AND pm.post_id > %d
-                 ORDER BY pm.post_id ASC
-                 LIMIT %d",
-                ACO_AT_RECORD_ID_META,
-                $last_id,
-                $batch
-            )
-        );
-        if ( empty( $rows ) ) { break; }
-        foreach ( $rows as $r ) {
-            $wp_map[ (string) $r->record_id ] = (int) $r->post_id;
-            $last_id = (int) $r->post_id;
-        }
-    } while ( count( $rows ) === $batch );
-
-    $to_delete = array_diff_key( $wp_map, $airtable_ids );
-    $deleted = 0;
-
-    foreach ( $to_delete as $record_id => $post_id ) {
-        $p = get_post( $post_id );
-        if ( ! $p || $p->post_type !== 'resource' || $p->post_status !== 'publish' ) { continue; }
-
-        $ok = wp_update_post( [ 'ID' => $post_id, 'post_status' => 'private' ], true );
-        if ( ! is_wp_error( $ok ) ) {
-            update_post_meta( $post_id, '_aco_sync_deleted_on', gmdate( 'c' ) );
-            $deleted++;
-            aco_re_log( 'info', 'Soft-deleted resource.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'post_id' => $post_id, 'record_id' => $record_id ] );
-        } else {
-            aco_re_log( 'warning', 'Soft-delete failed.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'post_id' => $post_id, 'record_id' => $record_id, 'error' => $ok->get_error_message() ] );
-        }
-    }
-
-    aco_re_log( 'info', 'Stage 2 (Deletes) completed.', [ 'source' => 'nightly', 'sync_id' => $sync_id, 'deleted_count' => $deleted ] );
-    return [ 'deleted' => $deleted ];
-}
-
-/**
- * Sends the nightly sync summary email.
- */
-function _aco_re_nightly_sync_send_summary_email( array $summary ) {
-    $to = apply_filters( 'aco_re_nightly_sync_email_to', get_option( 'admin_email' ) );
-    $subject = sprintf(
-        '[%s] Airtable Nightly Sync: %s',
-        wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES ),
-        empty( $summary['errors'] ) ? 'Success' : 'FAILED'
-    );
-
-    $body  = "Airtable to WordPress nightly sync completed.
-
-";
-    $body .= "Start:    {$summary['start_time']} UTC
-";
-    $body .= "End:      {$summary['end_time']} UTC
-";
-    $body .= "Duration: {$summary['duration_s']} seconds
-";
-    $body .= "-----------------------------------------
-";
-    $body .= "Upserts enqueued: {$summary['enqueued_upserts']}
-";
-    $body .= "Soft-deleted:     {$summary['deleted']}
-";
-    if ( ! empty( $summary['errors'] ) ) {
-        $body .= "-----------------------------------------
-Errors:
-";
-        foreach ( (array) $summary['errors'] as $e ) { $body .= "- {$e}
-"; }
-    }
-
-    wp_mail( $to, $subject, $body );
-}
-
-/**
- * Schedules the nightly sync to run at 02:30 UTC.
- */
-function aco_re_schedule_nightly_sync() {
-    if ( ! wp_next_scheduled( 'aco_re_nightly_delta_sync_hook' ) ) {
-        $ts = strtotime( 'tomorrow 02:30:00 UTC' );
-        wp_schedule_event( $ts, 'daily', 'aco_re_nightly_delta_sync_hook' );
-    }
-}
-
-/**
- * Clears the nightly sync cron job on deactivation.
- */
-function aco_re_clear_nightly_sync() {
-    wp_clear_scheduled_hook( 'aco_re_nightly_delta_sync_hook' );
-}
-
-
 // --- Hook Registrations ---
 
 // --- Activation / Deactivation / Uninstall Hooks ---
 
 register_activation_hook( __FILE__, function () {
-    aco_re_create_sync_log_table();
+    update_option('aco_re_activation_test', time()); // <-- ADD THIS LINE
+
+    // Call the function to create the table
+    aco_re_create_sync_log_table(); 
+
+    // Original activation logic
     if ( $admin_role = get_role( 'administrator' ) ) {
         $admin_role->add_cap( 'aco_manage_failover' );
     }
@@ -2070,34 +1127,32 @@ register_activation_hook( __FILE__, function () {
     if ( ! wp_next_scheduled( 'aco_re_hourly_tag_sync_hook' ) ) {
         wp_schedule_event( time(), 'hourly', 'aco_re_hourly_tag_sync_hook' );
     }
-    aco_re_schedule_nightly_sync(); // Add this line
     aco_re_register_content_models();
     flush_rewrite_rules();
 } );
 
 register_deactivation_hook( __FILE__, function () {
     wp_clear_scheduled_hook( 'aco_re_hourly_tag_sync_hook' );
-    aco_re_clear_nightly_sync(); // Add this line
     flush_rewrite_rules();
 } );
 
 register_uninstall_hook( __FILE__, 'aco_re_on_uninstall' );
 
 
-// --- Main Plugin Hooks ---
 
-add_action( 'init', 'aco_re_register_content_models' );
-add_action( 'init', 'aco_re_seed_terms_conditionally', 20 );
-add_action( 'init', 'aco_re_ensure_admin_capability', 1 );
+
 add_action( 'init', 'aco_re_register_log_purge_cron' );
 add_action( 'aco_re_daily_log_purge', 'aco_re_purge_old_logs' );
-add_action( 'aco_re_nightly_delta_sync_hook', 'aco_re_run_nightly_delta_sync' ); // Add this line
+
+
 
 add_action( 'admin_init', 'aco_re_register_settings' );
 add_action( 'admin_init', 'aco_re_register_tag_governance_settings' );
 add_action( 'admin_init', 'aco_re_handle_manual_tag_refresh' );
-
 add_action( 'plugins_loaded', 'aco_re_load_text_domain' );
+add_action( 'init', 'aco_re_register_content_models' );
+add_action( 'init', 'aco_re_seed_terms_conditionally', 20 );
+add_action( 'init', 'aco_re_ensure_admin_capability', 1 );
 add_action( 'admin_menu', 'aco_re_register_settings_page' );
 add_action( 'admin_enqueue_scripts', 'aco_re_enqueue_linter_script' );
 add_action( 'wp_dashboard_setup', 'aco_re_register_dashboard_widget' );
@@ -2111,12 +1166,53 @@ add_filter( 'wp_calculate_image_srcset', 'aco_re_failover_srcset_swap', 99 );
 add_filter( 'wp_get_attachment_image_attributes', 'aco_re_failover_img_attr_swap', 99 );
 add_filter( 'site_status_tests', 'aco_re_add_site_health_test' );
 add_action('plugins_loaded', function() {
+        // First, check if ACF Pro is active to prevent errors if it's disabled.
     if (function_exists('acf_is_pro') && acf_is_pro()) {
+        // Add the filter, now that we know it's safe to do so.
         add_filter('acf/settings/remove_wp_meta_box', '__return_false');
     }
 });
 
+<?php
 // --- START: ACO Sync Log Admin Viewer ---
+
+// 1. Register the admin page under the "Tools" menu.
+function aco_re_register_log_viewer_page() {
+    $hook_suffix = add_management_page(
+        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
+        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
+        'manage_options',
+        'aco-sync-log',
+        'aco_re_render_log_viewer_page'
+    );
+    // Action to add screen options
+    add_action( "load-{$hook_suffix}", 'aco_re_log_viewer_screen_options' );
+}
+add_action( 'admin_menu', 'aco_re_register_log_viewer_page' );
+
+// 2. Render the admin page.
+function aco_re_render_log_viewer_page() {
+    // Re-check capability as a defense-in-depth measure.
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'fpm-aco-resource-engine' ) );
+    }
+
+    $log_list_table = new ACO_Sync_Log_List_Table();
+    $log_list_table->prepare_items();
+    ?>
+    <div class="wrap">
+        <h1 class="wp-heading-inline"><?php esc_html_e( 'Airtable to WP Sync Log', 'fpm-aco-resource-engine' ); ?></h1>
+        <p><?php esc_html_e( 'This log shows the history of operations triggered by Airtable.', 'fpm-aco-resource-engine' ); ?></p>
+        <form method="get">
+            <input type="hidden" name="page" value="<?php echo isset( $_REQUEST['page'] ) ? esc_attr( $_REQUEST['page'] ) : ''; ?>" />
+            <?php
+            $log_list_table->search_box( __( 'Search Logs', 'fpm-aco-resource-engine' ), 'aco-sync-log-search' );
+            $log_list_table->display();
+            ?>
+        </form>
+    </div>
+    <?php
+}
 
 // 3. Add Screen Options
 function aco_re_log_viewer_screen_options() {
@@ -2132,14 +1228,11 @@ function aco_re_log_viewer_screen_options() {
 }
 
 
-// 4. Ensure WP_List_Table is available.
+// 4. Create the WP_List_Table class for our log.
 if ( ! class_exists( 'WP_List_Table' ) ) {
     require_once ABSPATH . 'wp-admin/includes/class-wp-list-table.php';
 }
 
-/**
- * Consolidated list table with Replay support.
- */
 class ACO_Sync_Log_List_Table extends WP_List_Table {
 
     public function __construct() {
@@ -2176,43 +1269,37 @@ class ACO_Sync_Log_List_Table extends WP_List_Table {
     }
     
     protected function extra_tablenav( $which ) {
-		if ( 'top' !== $which ) {
-			return;
-		}
-		global $wpdb;
-		$table_name = $wpdb->prefix . 'aco_sync_log';
+        if ( 'top' !== $which ) {
+            return;
+        }
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'aco_sync_log';
+        
+        $statuses = $wpdb->get_col( "SELECT DISTINCT status FROM {$table_name} ORDER BY status ASC" );
+        $current_status = isset( $_GET['status_filter'] ) ? sanitize_text_field( $_GET['status_filter'] ) : '';
+        
+        $sources = $wpdb->get_col( "SELECT DISTINCT source FROM {$table_name} ORDER BY source ASC" );
+        $current_source = isset( $_GET['source_filter'] ) ? sanitize_text_field( $_GET['source_filter'] ) : '';
+        
+        echo '<div class="alignleft actions">';
+        
+        echo '<select name="status_filter">';
+        echo '<option value="">' . esc_html__( 'All Statuses', 'fpm-aco-resource-engine' ) . '</option>';
+        foreach ( $statuses as $status ) {
+            printf( '<option value="%s" %s>%s</option>', esc_attr( $status ), selected( $current_status, $status, false ), esc_html( ucfirst( $status ) ) );
+        }
+        echo '</select>';
 
-		$statuses       = $wpdb->get_col( "SELECT DISTINCT status FROM {$table_name} ORDER BY status ASC" );
-		$current_status = isset( $_GET['status_filter'] ) ? sanitize_text_field( $_GET['status_filter'] ) : '';
+        echo '<select name="source_filter">';
+        echo '<option value="">' . esc_html__( 'All Sources', 'fpm-aco-resource-engine' ) . '</option>';
+        foreach ( $sources as $source ) {
+            printf( '<option value="%s" %s>%s</option>', esc_attr( $source ), selected( $current_source, $source, false ), esc_html( ucfirst( $source ) ) );
+        }
+        echo '</select>';
 
-		$sources        = $wpdb->get_col( "SELECT DISTINCT source FROM {$table_name} ORDER BY source ASC" );
-		$current_source = isset( $_GET['source_filter'] ) ? sanitize_text_field( $_GET['source_filter'] ) : '';
-
-		echo '<div class="alignleft actions">';
-
-		echo '<select name="status_filter">';
-		echo '<option value="">' . esc_html__( 'All Statuses', 'fpm-aco-resource-engine' ) . '</option>';
-		foreach ( $statuses as $status ) {
-			printf( '<option value="%s" %s>%s</option>', esc_attr( $status ), selected( $current_status, $status, false ), esc_html( ucfirst( $status ) ) );
-		}
-		echo '</select>';
-
-		echo '<select name="source_filter">';
-		echo '<option value="">' . esc_html__( 'All Sources', 'fpm-aco-resource-engine' ) . '</option>';
-		foreach ( $sources as $source ) {
-			printf( '<option value="%s" %s>%s</option>', esc_attr( $source ), selected( $current_source, $source, false ), esc_html( ucfirst( $source ) ) );
-		}
-		echo '</select>';
-
-		submit_button( __( 'Filter', 'fpm-aco-resource-engine' ), 'secondary', 'filter_action', false, [ 'id' => 'post-query-submit' ] );
-
-		// Add the nonce for security
-		wp_nonce_field( 'aco_export_sync_log_nonce', 'aco_export_nonce' );
-		// Add the export button
-		submit_button( __( 'Export to CSV', 'fpm-aco-resource-engine' ), 'secondary', 'export_csv', false );
-
-		echo '</div>';
-	}
+        submit_button( __( 'Filter', 'fpm-aco-resource-engine' ), 'secondary', 'filter_action', false );
+        echo '</div>';
+    }
 
     public function prepare_items() {
         global $wpdb;
@@ -2292,243 +1379,34 @@ class ACO_Sync_Log_List_Table extends WP_List_Table {
         }
         return 'N/A';
     }
-
-    public function column_message( $item ) {
-        $raw_data = $item['message'] ?? '';
-        $data = aco_re_safe_parse_message( $raw_data );
-        $message = isset( $data['message'] ) && is_string( $data['message'] ) 
-                   ? $data['message'] 
-                   : __( 'Could not read message.', 'fpm-aco-resource-engine' );
-
-        return esc_html( $message );
-    }
-    
-    public function column_record_id( $item ) {
-        $record_id = isset( $item['record_id'] ) ? esc_html( $item['record_id'] ) : '';
-        $actions = [];
-
-        $status = $item['status'] ?? '';
-        if ( in_array( $status, [ 'failed', 'error' ], true ) && ! empty( $item['id'] ) ) {
-            $replay_url = wp_nonce_url( add_query_arg( [
-                'page'    => 'aco-sync-log',
-                'action'  => 'replay',
-                'log_id'  => $item['id'],
-            ], admin_url( 'tools.php' ) ), 'aco_replay_log_' . $item['id'] );
-            
-            $actions['replay'] = sprintf( '<a href="%s">%s</a>', esc_url( $replay_url ), __( 'Replay', 'fpm-aco-resource-engine' ) );
-        }
-
-        return $record_id . $this->row_actions( $actions );
-    }
 }
 
-// 1. Register the admin page under the "Tools" menu. (Consolidated)
-function aco_re_register_log_viewer_page() {
-    $hook_suffix = add_management_page(
-        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
-        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
-        'manage_options',
-        'aco-sync-log',
-        'aco_re_render_log_viewer_page'
-    );
-    // Action to add screen options
-    add_action( "load-{$hook_suffix}", 'aco_re_log_viewer_screen_options' );
-}
-add_action( 'admin_menu', 'aco_re_register_log_viewer_page' );
-
-// 2. Render the admin page. (Consolidated)
-function aco_re_render_log_viewer_page() {
-    // Re-check capability as a defense-in-depth measure.
-    if ( ! current_user_can( 'manage_options' ) ) {
-        wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'fpm-aco-resource-engine' ) );
-    }
-
-    $log_list_table = new ACO_Sync_Log_List_Table();
-    $log_list_table->prepare_items();
-    ?>
-    <div class="wrap">
-        <h1 class="wp-heading-inline"><?php esc_html_e( 'Airtable to WP Sync Log', 'fpm-aco-resource-engine' ); ?></h1>
-        <p><?php esc_html_e( 'This log shows the history of operations triggered by Airtable.', 'fpm-aco-resource-engine' ); ?></p>
-        <form method="get">
-            <input type="hidden" name="page" value="aco-sync-log" />
-            <?php
-            $log_list_table->search_box( __( 'Search Logs', 'fpm-aco-resource-engine' ), 'aco-sync-log-search' );
-            $log_list_table->display();
-            ?>
-        </form>
-    </div>
-    <?php
-}
 // --- END: ACO Sync Log Admin Viewer ---
 
 // --- START: Replay Failed Jobs (Hardened Version) ---
 
 /**
- * Make arbitrary values safe for CSV (mitigate Excel/LibreOffice formula injection).
- * - Coerce to string; normalise newlines to \n (fputcsv handles quoting).
- * - Prefix apostrophe if the value begins with =, +, -, @
+ * Safely parses a string that might be serialized or JSON.
+ * It prioritizes JSON, forbids object unserialization, and always returns an array.
+ *
+ * @param mixed $raw_data The raw data from the database.
+ * @return array The parsed data, or an empty array on failure.
  */
-function aco_re_csv_safe_cell( $value ) {
-	if ( is_null( $value ) ) {
-		$value = '';
-	} elseif ( is_bool( $value ) ) {
-		$value = $value ? '1' : '0';
-	} elseif ( is_array( $value ) || is_object( $value ) ) {
-		$value = wp_json_encode( $value );
-	} else {
-		$value = (string) $value;
-	}
-
-	$value = str_replace( [ "\r\n", "\r" ], "\n", $value );
-
-	if ( $value !== '' ) {
-		$first = substr( $value, 0, 1 );
-		if ( in_array( $first, [ '=', '+', '-', '@' ], true ) ) {
-			$value = "'" . $value; // Leading apostrophe is respected by Excel.
-		}
-	}
-	return $value;
-}
-
-/**
- * Handles the trigger for exporting the sync log to a CSV file.
- * This function listens for a specific GET parameter, verifies security,
- * and then calls the logic to generate and stream the file.
- */
-function aco_re_handle_csv_export() {
-	// Gate: only run on our log page & when requested.
-	if ( ! isset( $_GET['page'], $_GET['export_csv'] ) || 'aco-sync-log' !== $_GET['page'] ) {
-		return;
-	}
-
-	// Capability + CSRF.
-	if ( ! current_user_can( 'manage_options' ) ) {
-		wp_die( esc_html__( 'Permission denied.', 'fpm-aco-resource-engine' ), esc_html__( 'Access denied', 'fpm-aco-resource-engine' ), [ 'response' => 403, 'back_link' => true ] );
-	}
-	check_admin_referer( 'aco_export_sync_log_nonce', 'aco_export_nonce' );
-
-	// Fail fast if headers already sent.
-	if ( headers_sent() ) {
-		wp_die( esc_html__( 'Cannot stream CSV: headers already sent by another output.', 'fpm-aco-resource-engine' ) );
-	}
-
-	// Performance safety nets for larger exports.
-	if ( function_exists( 'wp_raise_memory_limit' ) ) {
-		wp_raise_memory_limit( 'admin' );
-	}
-	ignore_user_abort( true );
-	@set_time_limit( 0 );
-
-	global $wpdb;
-	$table_name = $wpdb->prefix . 'aco_sync_log';
-
-	// Build WHERE (mirrors prepare_items()).
-	$where_clauses = [];
-	if ( ! empty( $_GET['status_filter'] ) ) {
-		$where_clauses[] = $wpdb->prepare( 'status = %s', sanitize_text_field( wp_unslash( $_GET['status_filter'] ) ) );
-	}
-	if ( ! empty( $_GET['source_filter'] ) ) {
-		$where_clauses[] = $wpdb->prepare( 'source = %s', sanitize_text_field( wp_unslash( $_GET['source_filter'] ) ) );
-	}
-	if ( ! empty( $_GET['s'] ) ) {
-		$search_term   = '%' . $wpdb->esc_like( sanitize_text_field( wp_unslash( $_GET['s'] ) ) ) . '%';
-		$where_clauses[] = $wpdb->prepare( '(record_id LIKE %s OR message LIKE %s)', $search_term, $search_term );
-	}
-	$where_sql = $where_clauses ? 'WHERE ' . implode( ' AND ', $where_clauses ) : '';
-
-	// ORDER BY (whitelist).
-	$allowed_orderby = [ 'ts', 'source', 'status', 'action' ];
-	$orderby_param   = isset( $_GET['orderby'] ) ? sanitize_key( $_GET['orderby'] ) : 'ts';
-	$orderby         = in_array( $orderby_param, $allowed_orderby, true ) ? $orderby_param : 'ts';
-	$order_param     = isset( $_GET['order'] ) ? strtolower( (string) $_GET['order'] ) : 'desc';
-	$order           = in_array( $order_param, [ 'asc', 'desc' ], true ) ? $order_param : 'desc';
-
-	// Headers.
-	nocache_headers();
-	header( 'Content-Type: text/csv; charset=utf-8' );
-	header( 'X-Content-Type-Options: nosniff' );
-	$filename = 'aco-sync-log-' . gmdate( 'Y-m-d-His' ) . '.csv';
-	header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
-
-	// Open output stream.
-	$out = fopen( 'php://output', 'w' );
-
-	// Column set: include all key columns (spec parity).
-	$column_keys = [
-		'id', 'ts', 'source', 'record_id', 'last_modified', 'action',
-		'resource_id', 'attachment_id', 'fingerprint', 'status',
-		'attempts', 'duration_ms', 'error_code', 'message'
-	];
-	fputcsv( $out, $column_keys );
-
-	// Chunked stream to keep memory bounded.
-	$limit  = 1000;
-	$offset = 0;
-
-	do {
-		$sql  = $wpdb->prepare(
-			"SELECT * FROM {$table_name} {$where_sql} ORDER BY {$orderby} {$order} LIMIT %d OFFSET %d",
-			$limit,
-			$offset
-		);
-		$rows = $wpdb->get_results( $sql, ARRAY_A );
-
-		if ( empty( $rows ) ) {
-			break;
-		}
-
-		foreach ( $rows as $row ) {
-			// Extract a human-readable message, safely.
-			$parsed        = aco_re_safe_parse_message( $row['message'] ?? '' );
-			$row['message'] = ( isset( $parsed['message'] ) && is_string( $parsed['message'] ) ) ? $parsed['message'] : '';
-
-			// Build row in the defined column order with CSV-safe cells.
-			$csv = [];
-			foreach ( $column_keys as $key ) {
-				$csv[] = aco_re_csv_safe_cell( $row[ $key ] ?? '' );
-			}
-			fputcsv( $out, $csv );
-		}
-
-		// Advance window.
-		$offset += $limit;
-		// Flush to the client to avoid buffering.
-		if ( function_exists( 'flush' ) ) {
-			flush();
-		}
-		if ( function_exists( 'ob_flush' ) ) {
-			@ob_flush();
-		}
-	} while ( count( $rows ) === $limit );
-
-	fclose( $out );
-	exit;
-}
-
 function aco_re_safe_parse_message( $raw_data ): array {
-	if ( is_array( $raw_data ) ) {
-		return $raw_data;
-	}
-	if ( ! is_string( $raw_data ) || $raw_data === '' ) {
-		return [];
-	}
-
-	// Try JSON first (docstring intent).
-	$trim = ltrim( $raw_data );
-	if ( $trim !== '' && ( $trim[0] === '{' || $trim[0] === '[' ) ) {
-		$json = json_decode( $raw_data, true );
-		if ( is_array( $json ) ) {
-			return $json;
-		}
-	}
-
-	// Fallback: PHP serialised array, forbid objects.
-	if ( strpos( $raw_data, 'a:' ) === 0 && strpos( $raw_data, '{' ) !== false ) {
-		$data = @unserialize( $raw_data, [ 'allowed_classes' => false ] );
-		return is_array( $data ) ? $data : [];
-	}
-
-	return [];
+    if ( is_array( $raw_data ) ) {
+        return $raw_data;
+    }
+    if ( ! is_string( $raw_data ) || empty( $raw_data ) ) {
+        return [];
+    }
+    // PHP's is_serialized() is unreliable. We check for the typical structure.
+    if ( strpos( $raw_data, 'a:' ) === 0 && strpos( $raw_data, '{' ) > 0 ) {
+        // Only unserialize if it looks like a serialized array.
+        // Forbidding classes is the critical security measure.
+        $data = @unserialize( $raw_data, [ 'allowed_classes' => false ] );
+        return is_array( $data ) ? $data : [];
+    }
+    return [];
 }
 
 /**
@@ -2563,22 +1441,21 @@ function aco_re_handle_log_actions() {
     $log_entry = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$table_name} WHERE id = %d", $log_id ), ARRAY_A );
 
     if ( ! $log_entry ) {
-        set_transient( 'aco_replay_notice_' . get_current_user_id(), [ 'type' => 'error', 'message' => __( 'Log entry not found.', 'fpm-aco-resource-engine' ) ] );
+        set_transient( 'aco_replay_notice', [ 'type' => 'error', 'message' => __( 'Log entry not found.', 'fpm-aco-resource-engine' ) ] );
     } else {
         $data    = aco_re_safe_parse_message( $log_entry['message'] );
         $context = isset( $data['context'] ) && is_array( $data['context'] ) ? $data['context'] : [];
         $payload = $context['payload'] ?? null;
         
         if ( $payload && function_exists( 'as_enqueue_async_action' ) ) {
-            // Enqueue the correct action hook name used by the worker.
-            as_enqueue_async_action( 'aco_re_process_resource_sync', [ 'payload' => $payload ], 'aco_resource_sync' );
+            as_enqueue_async_action( 'aco_re_process_resource_sync_action', [ 'payload' => $payload ], 'aco_resource_sync' );
             $message = sprintf( 
                 __( 'Job for Airtable Record ID %s has been re-queued.', 'fpm-aco-resource-engine' ), 
                 '<strong>' . esc_html( $log_entry['record_id'] ) . '</strong>'
             );
-            set_transient( 'aco_replay_notice_' . get_current_user_id(), [ 'type' => 'success', 'message' => $message ] );
+            set_transient( 'aco_replay_notice', [ 'type' => 'success', 'message' => $message ] );
         } else {
-            set_transient( 'aco_replay_notice_' . get_current_user_id(), [ 'type' => 'error', 'message' => __( 'Could not re-queue job. The payload was missing or Action Scheduler is inactive.', 'fpm-aco-resource-engine' ) ] );
+            set_transient( 'aco_replay_notice', [ 'type' => 'error', 'message' => __( 'Could not re-queue job. The payload was missing or Action Scheduler is inactive.', 'fpm-aco-resource-engine' ) ] );
         }
     }
     
@@ -2586,767 +1463,94 @@ function aco_re_handle_log_actions() {
     exit;
 }
 add_action( 'admin_init', 'aco_re_handle_log_actions' );
-add_action( 'admin_init', 'aco_re_handle_csv_export' );
 
 /**
  * Displays the admin notice after a replay action.
  */
 function aco_re_show_replay_notices() {
-    $uid = get_current_user_id();
-    $key = 'aco_replay_notice_' . ( $uid ?: 0 ); // fallback to 0 if ever needed
-    if ( $notice = get_transient( $key ) ) {
+    if ( $notice = get_transient( 'aco_replay_notice' ) ) {
         printf(
             '<div class="notice notice-%s is-dismissible"><p>%s</p></div>',
             esc_attr( $notice['type'] ),
-            wp_kses_post( $notice['message'] )
+            wp_kses_post( $notice['message'] ) // Use wp_kses_post to allow for <strong> tag.
         );
-        delete_transient( $key );
+        delete_transient( 'aco_replay_notice' );
     }
 }
 add_action( 'admin_notices', 'aco_re_show_replay_notices' );
 
+/**
+ * We need to unhook the old page registration and renderer
+ * before we can hook in the new ones that use our final List Table class.
+ */
+function aco_re_remove_original_log_viewer() {
+    remove_action( 'admin_menu', 'aco_re_register_log_viewer_page' );
+}
+add_action( 'admin_init', 'aco_re_remove_original_log_viewer', 9 ); // Run early.
+
+class ACO_Sync_Log_List_Table_Final extends ACO_Sync_Log_List_Table {
+    
+    function column_message( $item ) {
+        $raw_data = $item['message'] ?? '';
+        $data = aco_re_safe_parse_message( $raw_data );
+        $message = isset( $data['message'] ) && is_string( $data['message'] ) 
+                   ? $data['message'] 
+                   : __( 'Could not read message.', 'fpm-aco-resource-engine' );
+
+        return esc_html( $message );
+    }
+    
+    function column_record_id( $item ) {
+        $record_id = isset( $item['record_id'] ) ? esc_html( $item['record_id'] ) : '';
+        $actions = [];
+
+        $status = $item['status'] ?? '';
+        if ( in_array( $status, [ 'failed', 'error' ], true ) && ! empty( $item['id'] ) ) {
+            $replay_url = wp_nonce_url( add_query_arg( [
+                'page'     => 'aco-sync-log',
+                'action'   => 'replay',
+                'log_id'   => $item['id'],
+            ], admin_url( 'tools.php' ) ), 'aco_replay_log_' . $item['id'] );
+            
+            $actions['replay'] = sprintf( '<a href="%s">%s</a>', esc_url( $replay_url ), __( 'Replay', 'fpm-aco-resource-engine' ) );
+        }
+
+        return $record_id . $this->row_actions( $actions );
+    }
+}
+
+function aco_re_register_log_viewer_page_final() {
+    $hook_suffix = add_management_page(
+        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
+        __( 'ACO Sync Log', 'fpm-aco-resource-engine' ),
+        'manage_options',
+        'aco-sync-log',
+        'aco_re_render_log_viewer_page_final'
+    );
+    add_action( "load-{$hook_suffix}", 'aco_re_log_viewer_screen_options' );
+}
+add_action( 'admin_menu', 'aco_re_register_log_viewer_page_final' );
+
+function aco_re_render_log_viewer_page_final() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_die( esc_html__( 'You do not have sufficient permissions to access this page.', 'fpm-aco-resource-engine' ) );
+    }
+
+    $log_list_table = new ACO_Sync_Log_List_Table_Final(); // Use the final class name
+    $log_list_table->prepare_items();
+    ?>
+    <div class="wrap">
+        <h1 class="wp-heading-inline"><?php esc_html_e( 'Airtable to WP Sync Log', 'fpm-aco-resource-engine' ); ?></h1>
+        <p><?php esc_html_e( 'This log shows the history of operations triggered by Airtable.', 'fpm-aco-resource-engine' ); ?></p>
+        <form method="get">
+            <input type="hidden" name="page" value="aco-sync-log" />
+            <?php
+            $log_list_table->search_box( __( 'Search Logs', 'fpm-aco-resource-engine' ), 'aco-sync-log-search' );
+            $log_list_table->display();
+            ?>
+        </form>
+    </div>
+    <?php
+}
 // --- END: Replay Failed Jobs (Hardened Version) ---
-
-add_action('enqueue_block_editor_assets', function () {
-    $path = plugin_dir_path(__FILE__) . 'admin/promote.js';
-    if ( file_exists( $path ) ) {
-        wp_enqueue_script(
-            'aco-re-promote',
-            plugin_dir_url(__FILE__) . 'admin/promote.js',
-            [ 'wp-data', 'wp-dom-ready', 'wp-api-fetch', 'wp-notices' ],
-            filemtime( $path ),
-            true
-        );
-    }
-});
-
-// -- BEGIN: ACO Promote-to-Resource (v1) --
-
-/**
- * Feature kill-switch (filterable).
- */
-function aco_re_promote_enabled(): bool {
-    return (bool) apply_filters('aco_re_promote_enabled', true);
-}
-
-/**
- * Capability: ensure on activation and defensively on init.
- */
-register_activation_hook(__FILE__, function () {
-    if ($r = get_role('administrator')) { $r->add_cap('aco_promote_resource'); }
-    if ($r = get_role('editor'))        { $r->add_cap('aco_promote_resource'); }
-});
-
-// Ensure roles always have the promote capability (idempotent, cheap).
-add_action('init', function () {
-    if ($r = get_role('administrator')) { $r->add_cap('aco_promote_resource'); }
-    if ($r = get_role('editor'))        { $r->add_cap('aco_promote_resource'); }
-}, 1);
-
-function aco_re_current_user_can_promote(): bool {
-    $can = current_user_can('aco_promote_resource');
-    return (bool) apply_filters('aco_can_promote', $can);
-}
-
-/**
- * Allowed source types (filterable). Default to posts only in v1.
- * Add Events later via the 'aco_re_promote_allowed_source_types' filter.
- */
-function aco_re_get_promote_allowed_source_types(): array {
-    $default = [ 'post' ];
-    return (array) apply_filters('aco_re_promote_allowed_source_types', $default);
-}
-
-/**
- * Compute or retrieve the attachment fingerprint.
- * Prefers saved meta, otherwise constructs s3:<bucket>:<path>|<filesize>.
- */
-function _aco_re_compute_attachment_fingerprint(int $attachment_id): string {
-    $existing = (string) get_post_meta($attachment_id, '_aco_file_fingerprint', true);
-    if ($existing !== '') {
-        return $existing;
-    }
-
-    $off = function_exists('aco_re_get_offload_info_with_retry')
-        ? aco_re_get_offload_info_with_retry($attachment_id)
-        : null;
-
-    $bucket = is_array($off) ? ($off['bucket'] ?? '') : '';
-    $path   = is_array($off) ? ($off['path'] ?? '')   : '';
-
-    $filesize = 0;
-    $meta = wp_get_attachment_metadata($attachment_id);
-    if (is_array($meta) && !empty($meta['filesize'])) {
-        $filesize = (int) $meta['filesize'];
-    }
-    if (!$filesize) {
-        $filepath = get_attached_file($attachment_id);
-        if ($filepath && file_exists($filepath)) {
-            $filesize = (int) filesize($filepath);
-        }
-    }
-
-    if ($bucket && $path && $filesize > 0) {
-        $fp = sprintf('s3:%s:%s|%d', $bucket, ltrim((string) $path, '/'), $filesize);
-        update_post_meta($attachment_id, '_aco_file_fingerprint', $fp);
-        return $fp;
-    }
-    return '';
-}
-
-/**
- * Airtable outbound (FileURL only), using project config and filterable table.
- */
-if (!function_exists('_aco_re_airtable_post_fileurl')) :
-function _aco_re_airtable_post_fileurl(string $file_url) {
-    if (!function_exists('_aco_re_get_config')) { return; }
-
-    $api_key = (string) _aco_re_get_config('ACO_AT_API_KEY');
-    $base_id = (string) _aco_re_get_config('ACO_AT_BASE_ID');
-    $table   = (string) _aco_re_get_config('ACO_AT_TABLE_RESOURCES_INBOX');
-    if (!$table) {
-        $table = (string) _aco_re_get_config('ACO_AT_TABLE_RESOURCES');
-    }
-    $table = (string) apply_filters('aco_re_airtable_outbound_table', $table);
-
-    if (!$api_key || !$base_id || !$table) {
-        if (function_exists('aco_re_log')) {
-            aco_re_log('warning', 'Airtable outbound skipped: config missing.', [
-                'source' => 'promote', 'action' => 'airtable_outbound'
-            ]);
-        }
-        return;
-    }
-
-    $endpoint = "https://api.airtable.com/v0/{$base_id}/{$table}";
-    $args = [
-        'headers' => [
-            'Authorization' => 'Bearer ' . $api_key,
-            'Content-Type'  => 'application/json',
-        ],
-        'timeout' => 15,
-        'body'    => wp_json_encode([ 'records' => [ [ 'fields' => [ 'FileURL' => $file_url ] ] ] ]),
-    ];
-    $res = wp_remote_post($endpoint, $args);
-
-    if (function_exists('aco_re_log')) {
-        $code = is_wp_error($res) ? 0 : (int) wp_remote_retrieve_response_code($res);
-        $level = (is_wp_error($res) || $code < 200 || $code >= 300) ? 'warning' : 'info';
-        $msg = $level === 'info' ? 'Airtable outbound ok.' : 'Airtable outbound failed.';
-        aco_re_log($level, $msg, [ 'source' => 'promote', 'action' => 'airtable_outbound', 'http_code' => $code ?: 'WP_Error' ]);
-    }
-}
-endif;
-
-/**
- * REST: POST /aco/v1/promote
- */
-add_action( 'rest_api_init', function () {
-    register_rest_route( 'aco/v1', '/promote', [
-        'methods'  => 'POST',
-
-        // Use a Closure so the handler is always callable.
-        'callback' => function ( WP_REST_Request $request ) {
-            // Delegate to our controller if available.
-            if ( function_exists( 'aco_re_promote_controller' ) ) {
-                return aco_re_promote_controller( $request );
-            }
-
-            // Absolute fallback: clear, actionable 500 instead of "invalid handler".
-            return new WP_Error(
-                'aco_promote_handler_missing',
-                __( 'Promote controller is not loaded. Check plugin load order and includes.', 'fpm-aco-resource-engine' ),
-                [ 'status' => 500 ]
-            );
-        },
-
-        // Permission check as a Closure; delegates if project helper exists, else safe fallback.
-        'permission_callback' => function ( WP_REST_Request $request ) {
-            if ( function_exists( 'aco_re_promote_permission_callback' ) ) {
-                return aco_re_promote_permission_callback( $request );
-            }
-
-            // Fallback: honour feature flag and core caps (Admins/Editors with edit access on this post).
-            $enabled = apply_filters( 'aco_re_promote_enabled', true );
-            if ( ! $enabled ) {
-                return new WP_Error( 'rest_forbidden', __( 'Promote is disabled.', 'fpm-aco-resource-engine' ), [ 'status' => 403 ] );
-            }
-
-            $post_id = (int) $request->get_param( 'postId' );
-            if ( $post_id <= 0 ) {
-                return new WP_Error( 'rest_invalid_param', __( 'postId must be a positive integer.', 'fpm-aco-resource-engine' ), [ 'status' => 400 ] );
-            }
-
-            if ( ! current_user_can( 'edit_post', $post_id ) || ! current_user_can( 'aco_promote_resource' ) ) {
-                return new WP_Error( 'rest_forbidden', __( 'You do not have permission to promote this resource.', 'fpm-aco-resource-engine' ), [ 'status' => 403 ] );
-            }
-
-            return true;
-        },
-
-        'args' => [
-            'postId'       => [ 'type' => 'integer', 'required' => true ],
-            'attachmentId' => [ 'type' => 'integer', 'required' => true ],
-            'tags'         => [ 'type' => 'array',   'required' => false, 'items' => [ 'type' => 'string' ] ],
-            'resourceType' => [ 'type' => 'string',  'required' => false ],
-            'postContent'  => [ 'type' => 'string',  'required' => false ],
-        ],
-    ] );
-} );
-
-function aco_re_promote_permission_callback(WP_REST_Request $request) {
-    if (!aco_re_promote_enabled()) {
-        return new WP_Error('rest_forbidden', __('This feature is disabled.', 'fpm-aco-resource-engine'), [ 'status' => 403 ]);
-    }
-
-    if (function_exists('aco_re_reject_oversized_requests')) {
-        $size_check = aco_re_reject_oversized_requests($request);
-        if (is_wp_error($size_check)) { return $size_check; }
-    }
-
-    $nonce = (string) ($request->get_header('X-WP-Nonce') ?: '');
-    if (!wp_verify_nonce($nonce, 'wp_rest')) {
-        return new WP_Error('rest_forbidden', __('Bad or missing nonce.', 'fpm-aco-resource-engine'), [ 'status' => 403 ]);
-    }
-    if (!aco_re_current_user_can_promote()) {
-        return new WP_Error('rest_forbidden', __('Insufficient permissions.', 'fpm-aco-resource-engine'), [ 'status' => 403 ]);
-    }
-
-    $post_id = (int) $request['postId'];
-    if ($post_id && ! current_user_can('edit_post', $post_id)) {
-        return new WP_Error('rest_forbidden', __('You cannot edit this post.', 'fpm-aco-resource-engine'), [ 'status' => 403 ]);
-    }
-    return true;
-}
-
-/**
- * Does the content contain a link to this attachment?
- *
- * Accepts either a WP_Post or a raw HTML content string.
- * - Recurses innerBlocks
- * - Resolves reusable blocks (core/block → wp_block post via attrs.ref)
- * - Depth limit (filterable) + visited-set to avoid cycles
- * - Compares URL *paths* scheme/host-agnostically (rawurldecode)
- * - Accepts ?attachment_id=<id> form and basename suffix as last resort
- * - Recognizes 'href' and generic 'url' attrs (Kadence & others)
- *
- * @param WP_Post|string $post_or_content
- * @param int            $attachment_id
- * @return bool
- */
-function aco_re_post_has_file_block_with_id( $post_or_content, int $attachment_id ): bool {
-    $attachment_id = (int) $attachment_id;
-    if ( $attachment_id <= 0 ) { return false; }
-
-    $content = '';
-    if ( is_string( $post_or_content ) ) {
-        $content = (string) $post_or_content;
-    } elseif ( $post_or_content instanceof WP_Post ) {
-        $content = (string) $post_or_content->post_content;
-    }
-    if ( $content === '' ) { return false; }
-
-    $file_url = wp_get_attachment_url( $attachment_id );
-    $page_url = get_attachment_link( $attachment_id );
-
-    $basename = '';
-    if ( $file_url ) {
-        $p = wp_parse_url( $file_url, PHP_URL_PATH );
-        if ( is_string( $p ) ) { $basename = basename( $p ); }
-    }
-    if ( $basename === '' ) {
-        $local = get_attached_file( $attachment_id );
-        if ( $local && file_exists( $local ) ) { $basename = basename( $local ); }
-    }
-
-    $same_path = static function( string $a, string $b ): bool {
-        if ( $a === '' || $b === '' ) { return false; }
-        $pa = wp_parse_url( $a ); $pb = wp_parse_url( $b );
-        $path_a = isset( $pa['path'] ) ? rtrim( rawurldecode( $pa['path'] ), '/' ) : '';
-        $path_b = isset( $pb['path'] ) ? rtrim( rawurldecode( $pb['path'] ), '/' ) : '';
-        return $path_a !== '' && $path_a === $path_b;
-    };
-    $href_points_to_attachment = static function( string $href ) use ( $attachment_id ): bool {
-        if ( $href === '' ) { return false; }
-        $parts = wp_parse_url( $href );
-        if ( empty( $parts['query'] ) ) { return false; }
-        parse_str( $parts['query'], $q );
-        return isset( $q['attachment_id'] ) && (int) $q['attachment_id'] === $attachment_id;
-    };
-
-    $blocks = parse_blocks( $content );
-    if ( is_array( $blocks ) ) {
-        $max_depth = (int) apply_filters( 'aco_re_promote_block_walk_max_depth', 10 );
-        $visited_reusable = [];
-
-        $walker = static function ( array $list, int $depth ) use (
-            &$walker, $attachment_id, $file_url, $page_url, $basename, $max_depth, &$visited_reusable,
-            $same_path, $href_points_to_attachment
-        ): bool {
-            if ( $depth > $max_depth ) { return false; }
-            foreach ( $list as $b ) {
-                $name  = isset( $b['blockName'] ) ? (string) $b['blockName'] : '';
-                $attrs = ( isset( $b['attrs'] ) && is_array( $b['attrs'] ) ) ? $b['attrs'] : [];
-
-                // core/file direct match by id
-                if ( $name === 'core/file' ) {
-                    $id = isset( $attrs['id'] ) ? (int) $attrs['id'] : 0;
-                    if ( $id === $attachment_id ) { return true; }
-                }
-
-                // URL-ish attributes used by many blocks (Kadence, buttons, etc.)
-                $url_candidates = [];
-                foreach ( [ 'href', 'url', 'textLinkHref', 'fileUrl' ] as $key ) {
-                    if ( isset( $attrs[ $key ] ) && is_string( $attrs[ $key ] ) && $attrs[ $key ] !== '' ) {
-                        $url_candidates[] = (string) $attrs[ $key ];
-                    }
-                }
-                foreach ( $url_candidates as $href ) {
-                    if ( $file_url && $same_path( $href, $file_url ) ) { return true; }
-                    if ( $page_url && $same_path( $href, $page_url ) ) { return true; }
-                    if ( $href_points_to_attachment( $href ) ) { return true; }
-                    if ( $basename !== '' ) {
-                        $path = (string) wp_parse_url( $href, PHP_URL_PATH );
-                        if ( $path && substr( $path, -strlen( $basename ) ) === $basename ) { return true; }
-                    }
-                }
-
-                // Resolve reusable blocks
-                if ( $name === 'core/block' ) {
-                    $ref = isset( $attrs['ref'] ) ? (int) $attrs['ref'] : 0;
-                    if ( $ref > 0 && empty( $visited_reusable[ $ref ] ) ) {
-                        $visited_reusable[ $ref ] = true;
-                        $ref_post = get_post( $ref );
-                        if ( $ref_post instanceof WP_Post && $ref_post->post_type === 'wp_block' ) {
-                            $ref_blocks = parse_blocks( (string) $ref_post->post_content );
-                            if ( is_array( $ref_blocks ) && $walker( $ref_blocks, $depth + 1 ) ) { return true; }
-                        }
-                    }
-                }
-
-                if ( ! empty( $b['innerBlocks'] ) && is_array( $b['innerBlocks'] ) ) {
-                    if ( $walker( $b['innerBlocks'], $depth + 1 ) ) { return true; }
-                }
-            }
-            return false;
-        };
-
-        if ( $walker( $blocks, 0 ) ) { return true; }
-    }
-
-    // Raw-content fallbacks
-    if ( $file_url && strpos( $content, $file_url ) !== false ) { return true; }
-    if ( $page_url && strpos( $content, $page_url ) !== false ) { return true; }
-    if ( $attachment_id && preg_match( '#(?:\?|&)(?:attachment_id)=' . preg_quote( (string) $attachment_id, '#' ) . '\b#', $content ) ) { return true; }
-    if ( $basename !== '' && preg_match( '#href=["\'][^"\']*' . preg_quote( $basename, '#' ) . '["\']#i', $content ) ) { return true; }
-
-    return false;
-}
-
-
-
-/**
- * Controller: POST /aco/v1/promote
- *
- * Expects JSON body: { postId: int, attachmentId: int, tags?: string[], resourceType?: string }
- */
-function aco_re_promote_controller( WP_REST_Request $request ) {
-    $t_start = microtime( true );
-
-    // ---- Params ----
-    $post_id       = (int) $request->get_param( 'postId' );
-    $attachment_id = (int) $request->get_param( 'attachmentId' );
-    $tags          = (array) ( $request->get_param( 'tags' ) ?: [] );
-    $resource_type = (string) ( $request->get_param( 'resourceType' ) ?: '' );
-
-    if ( $post_id <= 0 || $attachment_id <= 0 ) {
-        return new WP_Error( 'rest_invalid_param', __( 'postId and attachmentId are required.', 'fpm-aco-resource-engine' ), [ 'status' => 400 ] );
-    }
-
-    // ---- Load posts ----
-    $post = get_post( $post_id );
-    if ( ! $post ) {
-        return new WP_Error( 'post_not_found', __( 'The source post was not found.', 'fpm-aco-resource-engine' ), [ 'status' => 404 ] );
-    }
-
-    $allowed_types = aco_re_get_promote_allowed_source_types(); // defaults to ['post']
-    if ( ! in_array( $post->post_type, (array) $allowed_types, true ) ) {
-        return new WP_Error( 'bad_source_type', __( 'Promote is not allowed for this post type.', 'fpm-aco-resource-engine' ), [ 'status' => 400, 'postType' => $post->post_type ] );
-    }
-
-    $att = get_post( $attachment_id );
-    if ( ! $att || $att->post_type !== 'attachment' ) {
-        return new WP_Error( 'attachment_not_found', __( 'Attachment not found.', 'fpm-aco-resource-engine' ), [ 'status' => 404 ] );
-    }
-
-    $mime = (string) get_post_mime_type( $attachment_id );
-    if ( stripos( $mime, 'pdf' ) === false ) {
-        return new WP_Error( 'bad_mime', __( 'Only PDF files can be promoted.', 'fpm-aco-resource-engine' ), [ 'status' => 400, 'mime' => $mime ] );
-    }
-
-    $file_url = wp_get_attachment_url( $attachment_id );
-    if ( ! $file_url ) {
-        return new WP_Error( 'file_url_missing', __( 'Could not resolve the attachment URL.', 'fpm-aco-resource-engine' ), [ 'status' => 500 ] );
-    }
-
-// ---- Verify link presence (block-aware; supports unsaved editor content) ----
-$content_saved = (string) $post->post_content;
-$content_live  = (string) ( $request->get_param( 'postContent' ) ?: '' );
-$content_check = $content_live !== '' ? $content_live : $content_saved;
-
-$has_block = aco_re_post_has_file_block_with_id( $content_check, $attachment_id );
-$has_url   = ( $file_url && strpos( $content_check, $file_url ) !== false );
-
-// Attachment page URL present?
-$page_url  = get_attachment_link( $attachment_id );
-$has_page  = ( $page_url && strpos( $content_check, $page_url ) !== false );
-
-// Any link using ?attachment_id=<ID> ?
-$has_qs = (bool) preg_match(
-    '#href=["\'][^"\']*(?:\?|&)attachment_id=' . preg_quote( (string) $attachment_id, '#' ) . '\b[^"\']*["\']#i',
-    $content_check
-);
-
-// Any link whose href ends with the file's basename (plain or URL-encoded)?
-$basename      = '';
-$basename_enc  = '';
-$path_from_url = wp_parse_url( (string) $file_url, PHP_URL_PATH );
-if ( is_string( $path_from_url ) && $path_from_url !== '' ) {
-    $basename     = basename( rawurldecode( $path_from_url ) );
-    $basename_enc = rawurlencode( $basename );
-}
-if ( $basename === '' ) {
-    $local = get_attached_file( $attachment_id );
-    if ( $local && file_exists( $local ) ) {
-        $basename     = basename( $local );
-        $basename_enc = rawurlencode( $basename );
-    }
-}
-$has_basename = false;
-if ( $basename !== '' ) {
-    $has_basename = (bool) preg_match(
-        '#href=["\'][^"\']*(?:' . preg_quote( $basename, '#' ) . '|' . preg_quote( $basename_enc, '#' ) . ')[^"\']*["\']#i',
-        $content_check
-    );
-}
-
-if ( ! ( $has_block || $has_url || $has_page || $has_qs || $has_basename ) ) {
-    if ( function_exists( 'aco_re_log' ) ) {
-        aco_re_log( 'warning', 'Promote failed: file link not found in content (saved/live).', [
-            'source'        => 'promote',
-            'action'        => 'link_check',
-            'post_id'       => $post_id,
-            'attachment_id' => $attachment_id,
-            'used_live'     => $content_live !== '',
-        ] );
-    }
-    return new WP_Error(
-        'link_not_found',
-        __( 'The selected PDF is not present as a File block in this post.', 'fpm-aco-resource-engine' ),
-        [ 'status' => 400, 'postId' => $post_id, 'attachmentId' => $attachment_id, 'usedLive' => (bool) ( $content_live !== '' ) ]
-    );
-}
-
-    // ---- Create or reuse Resource by fingerprint ----
-    $fingerprint = (string) _aco_re_compute_attachment_fingerprint( $attachment_id );
-    if ( $fingerprint === '' ) {
-        // Fallback: dedupe by attachment id + (best-effort) size. Keeps behaviour deterministic if Offload info is unavailable.
-        $size = 0;
-        $meta = wp_get_attachment_metadata( $attachment_id );
-        if ( is_array( $meta ) && ! empty( $meta['filesize'] ) ) {
-            $size = (int) $meta['filesize'];
-        }
-        $fingerprint = sprintf( 'att:%d|%d', $attachment_id, $size );
-    }
-
-    $existing = get_posts( [
-        'post_type'              => 'resource',
-        'post_status'            => 'any',
-        'meta_key'               => '_aco_file_fingerprint',
-        'meta_value'             => $fingerprint,
-        'posts_per_page'         => 1,
-        'fields'                 => 'ids',
-        'no_found_rows'          => true,
-        'suppress_filters'       => true,
-        'cache_results'          => false,
-        'update_post_meta_cache' => false,
-        'update_post_term_cache' => false,
-    ] );
-    $resource_id = $existing ? (int) $existing[0] : 0;
-
-    if ( ! $resource_id ) {
-        $title_guess = get_the_title( $attachment_id );
-        if ( ! is_string( $title_guess ) || $title_guess === '' ) {
-            $title_guess = basename( wp_parse_url( $file_url, PHP_URL_PATH ) ?: 'document.pdf' );
-        }
-        $resource_id = wp_insert_post( [
-            'post_type'    => 'resource',
-            'post_status'  => 'publish',
-            'post_title'   => wp_strip_all_tags( $title_guess ),
-            'post_content' => '',
-        ], true );
-
-        if ( is_wp_error( $resource_id ) ) {
-            return new WP_Error( 'create_failed', __( 'Could not create the Resource.', 'fpm-aco-resource-engine' ), [ 'status' => 500, 'error' => $resource_id->get_error_message() ] );
-        }
-    }
-
-    // BEFORE re-parenting, capture whether the attachment belonged to the source post
-    $att = $att instanceof WP_Post ? $att : get_post( $attachment_id );
-    $was_parented_to_source = ( $att instanceof WP_Post ) ? ( (int) $att->post_parent === $post_id ) : false;
-
-    // ---- Parent the attachment to the resource ----
-    $parented = wp_update_post( [ 'ID' => $attachment_id, 'post_parent' => $resource_id ], true );
-    if ( is_wp_error( $parented ) ) {
-        return new WP_Error( 'parent_failed', __( 'Could not parent the attachment to the Resource.', 'fpm-aco-resource-engine' ), [ 'status' => 500, 'error' => $parented->get_error_message() ] );
-    }
-
-    // ---- Meta & taxonomy on the Resource ----
-    update_post_meta( $resource_id, '_aco_primary_attachment_id', $attachment_id );
-    update_post_meta( $resource_id, '_aco_file_fingerprint', $fingerprint );
-
-    if ( is_string( $resource_type ) && $resource_type !== '' ) {
-        if ( function_exists( '_aco_re_set_post_terms_from_names' ) ) {
-            _aco_re_set_post_terms_from_names( $resource_id, 'resource_type', [ $resource_type ], [ 'source' => 'promote', 'action' => 'set_type', 'post_id' => $resource_id ], false );
-        }
-    }
-    if ( ! empty( $tags ) ) {
-        $tags = array_values( array_filter( array_map( 'strval', $tags ) ) );
-        if ( function_exists( '_aco_re_set_post_terms_from_names' ) ) {
-            _aco_re_set_post_terms_from_names( $resource_id, 'universal_tag', $tags, [ 'source' => 'promote', 'action' => 'set_tags', 'post_id' => $resource_id ], true );
-        }
-    }
-    // ---- Rewrite the post content link (best-effort; saved + return patched live) ----
-    $resource_link  = get_permalink( $resource_id );
-    $patched_live   = null;
-    $did_rewrite_db = false;
-
-    if ( is_string( $resource_link ) && $resource_link !== '' ) {
-        // Build targets based on the canonical file URL and variants
-        $targets = array_filter( [
-            $file_url,
-            get_attachment_link( $attachment_id ),
-        ] );
-
-        // Also capture any hrefs with ?attachment_id=<ID> in the SAVED content
-        if ( preg_match_all(
-            '#href=["\']([^"\']*?(?:\?|&)attachment_id=' . preg_quote( (string) $attachment_id, '#' ) . '\b[^"\']*)["\']#i',
-            $content_saved,
-            $m
-        ) ) {
-            foreach ( array_unique( (array) $m[1] ) as $href ) {
-                $targets[] = $href;
-            }
-        }
-
-        $targets = array_values( array_unique( array_filter( $targets ) ) );
-
-        // Compute path + filename for path/filename based rewrites
-        $file_path = (string) wp_parse_url( $file_url, PHP_URL_PATH );
-        $basename  = $file_path ? basename( $file_path ) : '';
-
-        // Encoded variant of the path (to match blocks that URL-encode the href)
-        $encoded_path = '';
-        if ( $file_path ) {
-            $segments     = array_map( 'rawurlencode', array_filter( explode( '/', ltrim( $file_path, '/' ) ) ) );
-            $encoded_path = '/' . implode( '/', $segments );
-        }
-
-        $rewrite_once = static function( string $content ) use ( $targets, $file_path, $encoded_path, $basename, $resource_link ): string {
-            $updated = $content;
-
-            // 1) Exact known URLs → resource permalink
-            foreach ( $targets as $t ) {
-                $updated = str_replace( $t, $resource_link, $updated );
-            }
-
-            // 2) Path-based replace (host-agnostic, keeps existing quotes)
-            if ( $file_path ) {
-                $pattern_by_path = '#href=(["\'])([^"\']*' . preg_quote( $file_path, '#' ) . '(?:[?#][^"\']*)?)\1#i';
-                $updated = preg_replace( $pattern_by_path, 'href=$1' . esc_url( $resource_link ) . '$1', $updated ) ?? $updated;
-            }
-            if ( $encoded_path && $encoded_path !== $file_path ) {
-                $pattern_by_enc_path = '#href=(["\'])([^"\']*' . preg_quote( $encoded_path, '#' ) . '(?:[?#][^"\']*)?)\1#i';
-                $updated = preg_replace( $pattern_by_enc_path, 'href=$1' . esc_url( $resource_link ) . '$1', $updated ) ?? $updated;
-            }
-
-            // 3) Filename fallback (handles CDN domain swaps & transformed prefixes)
-            if ( $basename ) {
-                $pattern_by_name = '#href=(["\'])([^"\']*/' . preg_quote( $basename, '#' ) . '(?:[?#][^"\']*)?)\1#i';
-                $updated = preg_replace( $pattern_by_name, 'href=$1' . esc_url( $resource_link ) . '$1', $updated ) ?? $updated;
-            }
-
-            return $updated;
-        };
-
-        // Rewrite saved DB content
-        $updated_saved = $rewrite_once( $content_saved );
-        if ( $updated_saved !== $content_saved ) {
-            $u = wp_update_post( [ 'ID' => $post_id, 'post_content' => $updated_saved ], true );
-            $did_rewrite_db = ! is_wp_error( $u );
-            if ( is_wp_error( $u ) && function_exists( 'aco_re_log' ) ) {
-                aco_re_log( 'warning', 'Content rewrite failed (DB).', [
-                    'source'        => 'promote',
-                    'action'        => 'rewrite',
-                    'post_id'       => $post_id,
-                    'attachment_id' => $attachment_id,
-                    'error'         => $u->get_error_message(),
-                ] );
-            }
-        }
-
-        // If live/unsaved content was provided, return a patched version for the editor to adopt
-        if ( $content_live !== '' ) {
-            $updated_live = $rewrite_once( $content_live );
-            if ( $updated_live !== $content_live ) {
-                $patched_live = $updated_live;
-            }
-        }
-    }
-
-    // ---- Best-effort: post the FileURL to Airtable ----
-    if ( function_exists( '_aco_re_airtable_post_fileurl' ) ) {
-        try {
-            _aco_re_airtable_post_fileurl( $file_url );
-        } catch ( Throwable $e ) {
-            // Swallow errors in this ancillary step.
-        }
-    }
-
-    /**
-     * Re-index behaviour (SearchWP 4.x queue API)
-     *
-     * Filter: aco_re_reindex_source_on_promote
-     * Decide whether the source post should be re-indexed after a successful promote.
-     * Default: true ONLY when the source previously owned the attachment or its content linked the file.
-     * Signature: (bool $default, int $source_post_id, int $resource_post_id, int $attachment_id): bool
-     *
-     * Filter: aco_re_reindex_attachment_on_promote
-     * Decide whether the attachment itself should be re-indexed.
-     * Default: false. Enable if your SearchWP engines index attachments directly.
-     * Signature: (bool $default, int $source_post_id, int $resource_post_id, int $attachment_id): bool
-     */
-    if ( has_action( 'searchwp\\index\\enqueue' ) ) {
-        // Always enqueue the canonical Resource so its PDF content is indexed there.
-        do_action( 'searchwp\\index\\enqueue', 'post', $resource_id );
-
-        // ALSO re-index the source post when warranted (previously owned the PDF or content linked it).
-        $link_present = isset( $has_block, $has_url ) ? ( $has_block || $has_url ) : false;
-        $should_reindex_source = (bool) apply_filters(
-            'aco_re_reindex_source_on_promote',
-            ( $was_parented_to_source || $link_present ),
-            $post_id,
-            $resource_id,
-            $attachment_id
-        );
-        if ( $should_reindex_source ) {
-            do_action( 'searchwp\\index\\enqueue', 'post', $post_id );
-        }
-
-        // Optional: refresh the attachment’s own index entry (disabled by default)
-        if ( (bool) apply_filters( 'aco_re_reindex_attachment_on_promote', false, $post_id, $resource_id, $attachment_id ) ) {
-            do_action( 'searchwp\\index\\enqueue', 'post', $attachment_id );
-        }
-    }
-
-    // ---- Log & response ----
-    if ( function_exists( 'aco_re_log' ) ) {
-        aco_re_log( 'info', 'Promote completed.', [
-            'source'        => 'promote',
-            'action'        => 'promote',
-            'post_id'       => $post_id,
-            'resource_id'   => $resource_id,
-            'attachment_id' => $attachment_id,
-            'fingerprint'   => $fingerprint,
-            'duration_ms'   => (int) round( ( microtime( true ) - $t_start ) * 1000 ),
-        ] );
-    }
-
-    return new WP_REST_Response( [
-        'status'             => 'ok',
-        'resourceId'         => (int) $resource_id,
-        'attachmentId'       => (int) $attachment_id,
-        'postId'             => (int) $post_id,
-        'link'               => (string) get_permalink( $resource_id ),
-        'usedUnsavedContent' => (bool) ( $content_live !== '' ),
-        'didRewriteSaved'    => (bool) $did_rewrite_db,
-        'patchedContent'     => ( $patched_live !== null ) ? (string) $patched_live : null,
-    ], 200 );
-}
-
-// -- END: ACO Promote-to-Resource (v1) --
-
-if ( ! function_exists( 'aco_re_single_resource_template' ) ) {
-    /**
-     * Provide a default single template for the Resource post type when the theme does not supply one.
-     *
-     * @param string $single The path to the template WordPress intends to use.
-     * @return string
-     */
-    function aco_re_single_resource_template( $single ) {
-        if ( is_singular( 'resource' ) ) {
-            $template = plugin_dir_path( __FILE__ ) . 'templates/single-resource.php';
-            if ( file_exists( $template ) ) {
-                return $template;
-            }
-        }
-        return $single;
-    }
-}
-add_filter( 'single_template', 'aco_re_single_resource_template' );
-
-// --- SearchWP Integration ---
-
-/**
- * Hardened helper to get the current search scope from the request.
- *
- * @return string The validated scope, defaulting to 'all'.
- */
-function aco_re_get_search_scope_from_request(): string {
-    $scope   = isset( $_GET['scope'] ) ? sanitize_key( (string) $_GET['scope'] ) : '';
-    $allowed = (array) apply_filters( 'aco_re_allowed_search_scopes', [ 'all', 'resources', 'news' ] );
-    return in_array( $scope, $allowed, true ) ? $scope : 'all';
-}
-
-/**
- * Modifies the main WordPress query based on the 'scope' GET parameter for the global search.
- * This version uses an allowlist and a filterable map for post types.
- *
- * @param WP_Query $query The main WP_Query object.
- */
-function aco_re_modify_query_for_scope_selector( WP_Query $query ): void {
-    if ( is_admin() || ! $query->is_main_query() || ! $query->is_search() ) {
-        return;
-    }
-
-    $scope = aco_re_get_search_scope_from_request();
-
-    // Map each scope to the post types we want to include. Filterable for future extension.
-    $map = (array) apply_filters( 'aco_re_scope_to_post_types', [
-        'all'       => [ 'post', 'resource' ],
-        'resources' => [ 'resource' ],
-        'news'      => [ 'post' ],
-    ] );
-
-    if ( isset( $map[ $scope ] ) && is_array( $map[ $scope ] ) ) {
-        $query->set( 'post_type', array_values( array_unique( array_map( 'sanitize_key', $map[ $scope ] ) ) ) );
-    }
-}
-add_action( 'pre_get_posts', 'aco_re_modify_query_for_scope_selector' );
-
-/**
- * Feature-flagged stub for the programmatic SearchWP engine registration.
- * DO NOT enable this until the programmatic API for SearchWP v4 has been fully validated.
- *
- * @param array $engines The existing array of SearchWP engines.
- * @return array The modified array of engines.
- */
-function aco_re_register_searchwp_engine_placeholder( $engines ) {
-    if ( ! apply_filters( 'aco_re_enable_searchwp_resources_engine', false ) ) {
-        return $engines;
-    }
-    // Intentionally left blank pending API validation.
-    // When ready, the code to define the 'resources' engine will go here.
-    return $engines;
-}
-add_filter( 'searchwp\engines', 'aco_re_register_searchwp_engine_placeholder', 0 );
+?>
