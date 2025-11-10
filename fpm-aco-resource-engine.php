@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.2
+ * Version:         1.17.3
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1553,4 +1553,125 @@ function aco_re_render_log_viewer_page_final() {
     <?php
 }
 // --- END: Replay Failed Jobs (Hardened Version) ---
+
+// --- Shortcode: Resources filter bar [aco_resources_filter] ---
+if ( ! function_exists( 'aco_re_shortcode_resources_filter' ) ) {
+    /**
+     * Shortcode: [aco_resources_filter]
+     * Renders Type, Tag, Year and Sort controls that submit to the Resource archive.
+     * Relies on the archive query shaping (type, tag, year, sort) already in pre_get_posts.
+     */
+    function aco_re_shortcode_resources_filter( $atts = [] ) {
+        $archive_url = get_post_type_archive_link( 'resource' );
+        if ( ! $archive_url ) {
+            return '';
+        }
+
+        // Current values from the URL (GET).
+        $current_type = isset( $_GET['type'] ) ? sanitize_text_field( wp_unslash( $_GET['type'] ) ) : '';
+        $current_tag  = isset( $_GET['tag'] ) ? sanitize_text_field( wp_unslash( $_GET['tag'] ) ) : '';
+        $current_year = isset( $_GET['year'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['year'] ) : '';
+        $current_sort = isset( $_GET['sort'] ) ? sanitize_key( wp_unslash( $_GET['sort'] ) ) : 'newest';
+
+        // Terms for selects.
+        $type_terms = get_terms( [ 'taxonomy' => 'resource_type', 'hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC' ] );
+        if ( is_wp_error( $type_terms ) ) {
+            $type_terms = [];
+        }
+        $tag_terms = get_terms( [ 'taxonomy' => 'universal_tag', 'hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC' ] );
+        if ( is_wp_error( $tag_terms ) ) {
+            $tag_terms = [];
+        }
+
+        $years = function_exists( 'aco_re_get_available_resource_years' ) ? aco_re_get_available_resource_years() : [];
+
+        $html = <<<'HTML'
+<form class="aco-resources-filter-wrap" method="get" action="%ARCHIVE_URL%">
+    <div class="aco-filter-group">
+        <label for="aco_filter_type">Type</label>
+        <select id="aco_filter_type" name="type">
+            <option value="">All types</option>
+            %TYPE_OPTIONS%
+        </select>
+    </div>
+    <div class="aco-filter-group">
+        <label for="aco_filter_tag">Tag</label>
+        <select id="aco_filter_tag" name="tag">
+            <option value="">All tags</option>
+            %TAG_OPTIONS%
+        </select>
+    </div>
+    <div class="aco-filter-group">
+        <label for="aco_filter_year">Year</label>
+        <select id="aco_filter_year" name="year">
+            <option value="">Any year</option>
+            %YEAR_OPTIONS%
+        </select>
+    </div>
+    <div class="aco-filter-group">
+        <label for="aco_filter_sort">Sort</label>
+        <select id="aco_filter_sort" name="sort">
+            %SORT_OPTIONS%
+        </select>
+    </div>
+    %SEARCH_KEEP%
+    <input type="hidden" name="paged" value="1" />
+    <div class="aco-filter-actions">
+        <button type="submit" class="button">Apply</button>
+        <a class="aco-filter-reset" href="%ARCHIVE_URL%">Clear</a>
+    </div>
+    <style>
+        .aco-resources-filter-wrap{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin:0 0 16px}
+        .aco-resources-filter-wrap .aco-filter-group{display:flex;flex-direction:column;min-width:160px}
+        .aco-resources-filter-wrap .aco-filter-actions{display:flex;gap:8px}
+        .aco-resources-filter-wrap select,.aco-resources-filter-wrap button{min-height:40px}
+    </style>
+</form>
+HTML;
+
+        // Build options safely.
+        $type_opts = '';
+        foreach ( (array) $type_terms as $t ) {
+            $sel        = selected( $current_type, $t->slug, false );
+            $type_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $t->slug ), $sel, esc_html( $t->name ) );
+        }
+
+        $tag_opts = '';
+        foreach ( (array) $tag_terms as $t ) {
+            $sel       = selected( $current_tag, $t->slug, false );
+            $tag_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $t->slug ), $sel, esc_html( $t->name ) );
+        }
+
+        $year_opts = '';
+        foreach ( (array) $years as $y ) {
+            $sel        = selected( $current_year, (string) $y, false );
+            $year_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $y ), $sel, esc_html( $y ) );
+        }
+
+        $sort_opts = '';
+        $sort_map  = [
+            'newest' => 'Newest',
+            'oldest' => 'Oldest',
+            'title'  => 'Title A-Z',
+        ];
+        foreach ( $sort_map as $key => $label ) {
+            $sel        = selected( $current_sort, $key, false );
+            $sort_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $key ), $sel, esc_html( $label ) );
+        }
+
+        $search_keep = '';
+        if ( isset( $_GET['s'] ) && '' !== $_GET['s'] ) {
+            $search_keep = sprintf( '<input type="hidden" name="s" value="%s" />', esc_attr( sanitize_text_field( wp_unslash( $_GET['s'] ) ) ) );
+        }
+
+        $html = str_replace(
+            [ '%ARCHIVE_URL%', '%TYPE_OPTIONS%', '%TAG_OPTIONS%', '%YEAR_OPTIONS%', '%SORT_OPTIONS%', '%SEARCH_KEEP%' ],
+            [ esc_url( $archive_url ), $type_opts, $tag_opts, $year_opts, $sort_opts, $search_keep ],
+            $html
+        );
+
+        return $html;
+    }
+    add_shortcode( 'aco_resources_filter', 'aco_re_shortcode_resources_filter' );
+}
 ?>
