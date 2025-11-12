@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.5
+ * Version:         1.17.6
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1676,46 +1676,68 @@ if ( ! function_exists( 'aco_re_register_archive_query_vars' ) ) {
 }
 
 if ( ! function_exists( 'aco_re_apply_archive_filters_from_querystring' ) ) {
+    /**
+     * Apply Resource archive filters to BOTH the main archive query and secondary queries
+     * (e.g., Kadence Advanced Query Loop) when post_type includes 'resource'.
+     * - Year filter and sorting use _aco_document_date meta (DATE type).
+     */
     function aco_re_apply_archive_filters_from_querystring( $q ) {
-        if ( is_admin() || ! $q->is_main_query() ) { return; }
+        if ( is_admin() ) { return; }
 
-        // Apply on resource archive OR whenever our params are present.
-        $has_params = ( $q->get( 'r_type' ) || $q->get( 'r_tag' ) || $q->get( 'r_year' ) || $q->get( 'r_sort' ) );
-        if ( ! $q->is_post_type_archive( 'resource' ) && ! $has_params ) { return; }
+        // Read from $_GET so secondary queries can see the same inputs.
+        $r_type = isset( $_GET['r_type'] ) ? sanitize_title( wp_unslash( $_GET['r_type'] ) ) : '';
+        $r_tag  = isset( $_GET['r_tag'] )  ? sanitize_title( wp_unslash( $_GET['r_tag'] ) )  : '';
+        $r_year = isset( $_GET['r_year'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['r_year'] ) : '';
+        $r_sort = isset( $_GET['r_sort'] ) ? sanitize_key( wp_unslash( $_GET['r_sort'] ) ) : '';
+        $has_params = ( $r_type !== '' || $r_tag !== '' || $r_year !== '' || $r_sort !== '' );
 
-        // Force the context to resource posts when our params are used.
-        $q->set( 'post_type', 'resource' );
+        // Only touch Resource contexts: either the archive OR any query whose post_type includes 'resource'.
+        $pt = $q->get( 'post_type' );
+        $is_resource_query = $q->is_post_type_archive( 'resource' )
+            || ( $pt && ( ( is_array( $pt ) && in_array( 'resource', $pt, true ) ) || $pt === 'resource' ) );
+        if ( ! $is_resource_query && ! ( $has_params && $q->is_main_query() ) ) { return; }
 
-        // Tax filters.
-        $tax_query = [];
-        $r_type = sanitize_text_field( (string) $q->get( 'r_type' ) );
+        // Ensure post_type is resource when filters are used.
+        if ( ! $pt ) { $q->set( 'post_type', 'resource' ); }
+
+        // Taxonomy filters.
+        $tax_query = (array) $q->get( 'tax_query' );
         if ( $r_type !== '' ) {
             $tax_query[] = [ 'taxonomy' => 'resource_type', 'field' => 'slug', 'terms' => [ $r_type ] ];
         }
-        $r_tag = sanitize_text_field( (string) $q->get( 'r_tag' ) );
         if ( $r_tag !== '' ) {
             $tax_query[] = [ 'taxonomy' => 'universal_tag', 'field' => 'slug', 'terms' => [ $r_tag ] ];
         }
         if ( ! empty( $tax_query ) ) { $q->set( 'tax_query', $tax_query ); }
 
-        // Year → published year.
-        $r_year = preg_replace( '/[^0-9]/', '', (string) $q->get( 'r_year' ) );
-        if ( $r_year !== '' ) { $q->set( 'date_query', [ [ 'year' => (int) $r_year ] ] ); }
+        // Year filter on meta date (document date), not published date.
+        if ( $r_year !== '' ) {
+            $q->set( 'meta_query', [ [
+                'key'     => '_aco_document_date',
+                'value'   => [ sprintf( '%s-01-01', $r_year ), sprintf( '%s-12-31', $r_year ) ],
+                'compare' => 'BETWEEN',
+                'type'    => 'DATE',
+            ] ] );
+        }
 
-        // Sorting.
-        $sort = sanitize_key( (string) $q->get( 'r_sort' ) );
-        switch ( $sort ) {
+        // Sorting: newest/oldest by document date; title A–Z otherwise.
+        switch ( $r_sort ) {
             case 'oldest':
-                $q->set( 'orderby', 'date' );
+                $q->set( 'meta_key', '_aco_document_date' );
+                $q->set( 'meta_type', 'DATE' );
+                $q->set( 'orderby', 'meta_value' );
                 $q->set( 'order', 'ASC' );
                 break;
             case 'title':
                 $q->set( 'orderby', 'title' );
                 $q->set( 'order', 'ASC' );
                 break;
-            default:
-                $q->set( 'orderby', 'date' );
+            default: // newest
+                $q->set( 'meta_key', '_aco_document_date' );
+                $q->set( 'meta_type', 'DATE' );
+                $q->set( 'orderby', 'meta_value' );
                 $q->set( 'order', 'DESC' );
+                break;
         }
     }
     add_action( 'pre_get_posts', 'aco_re_apply_archive_filters_from_querystring', 11 );
