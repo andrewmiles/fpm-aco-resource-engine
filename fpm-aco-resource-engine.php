@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.3
+ * Version:         1.17.4
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1173,7 +1173,6 @@ add_action('plugins_loaded', function() {
     }
 });
 
-<?php
 // --- START: ACO Sync Log Admin Viewer ---
 
 // 1. Register the admin page under the "Tools" menu.
@@ -1553,39 +1552,32 @@ function aco_re_render_log_viewer_page_final() {
     <?php
 }
 // --- END: Replay Failed Jobs (Hardened Version) ---
-
 // --- Shortcode: Resources filter bar [aco_resources_filter] ---
 if ( ! function_exists( 'aco_re_shortcode_resources_filter' ) ) {
     /**
      * Shortcode: [aco_resources_filter]
      * Renders Type, Tag, Year and Sort controls that submit to the Resource archive.
-     * Relies on the archive query shaping (type, tag, year, sort) already in pre_get_posts.
+     * Safe implementation: single PHP context (no tag flips), nowdoc template, full escaping.
      */
     function aco_re_shortcode_resources_filter( $atts = [] ) {
         $archive_url = get_post_type_archive_link( 'resource' );
-        if ( ! $archive_url ) {
-            return '';
-        }
+        if ( ! $archive_url ) { return ''; }
 
         // Current values from the URL (GET).
         $current_type = isset( $_GET['type'] ) ? sanitize_text_field( wp_unslash( $_GET['type'] ) ) : '';
-        $current_tag  = isset( $_GET['tag'] ) ? sanitize_text_field( wp_unslash( $_GET['tag'] ) ) : '';
+        $current_tag  = isset( $_GET['tag'] )  ? sanitize_text_field( wp_unslash( $_GET['tag'] ) )  : '';
         $current_year = isset( $_GET['year'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['year'] ) : '';
         $current_sort = isset( $_GET['sort'] ) ? sanitize_key( wp_unslash( $_GET['sort'] ) ) : 'newest';
 
         // Terms for selects.
-        $type_terms = get_terms( [ 'taxonomy' => 'resource_type', 'hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC' ] );
-        if ( is_wp_error( $type_terms ) ) {
-            $type_terms = [];
-        }
-        $tag_terms = get_terms( [ 'taxonomy' => 'universal_tag', 'hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC' ] );
-        if ( is_wp_error( $tag_terms ) ) {
-            $tag_terms = [];
-        }
+        $type_terms = get_terms( [ 'taxonomy' => 'resource_type',  'hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC' ] );
+        if ( is_wp_error( $type_terms ) ) { $type_terms = []; }
+        $tag_terms  = get_terms( [ 'taxonomy' => 'universal_tag', 'hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC' ] );
+        if ( is_wp_error( $tag_terms ) ) { $tag_terms = []; }
 
-        $years = function_exists( 'aco_re_get_available_resource_years' ) ? aco_re_get_available_resource_years() : [];
+        $years = function_exists( 'aco_re_get_available_resource_years' ) ? (array) aco_re_get_available_resource_years() : [];
 
-        $html = <<<'HTML'
+        $template = <<<'HTML'
 <form class="aco-resources-filter-wrap" method="get" action="%ARCHIVE_URL%">
     <div class="aco-filter-group">
         <label for="aco_filter_type">Type</label>
@@ -1632,46 +1624,43 @@ HTML;
         // Build options safely.
         $type_opts = '';
         foreach ( (array) $type_terms as $t ) {
-            $sel        = selected( $current_type, $t->slug, false );
-            $type_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $t->slug ), $sel, esc_html( $t->name ) );
+            if ( ! isset( $t->slug, $t->name ) ) { continue; }
+            $sel = selected( $current_type, (string) $t->slug, false );
+            $type_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( (string) $t->slug ), $sel, esc_html( (string) $t->name ) );
         }
 
         $tag_opts = '';
         foreach ( (array) $tag_terms as $t ) {
-            $sel       = selected( $current_tag, $t->slug, false );
-            $tag_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $t->slug ), $sel, esc_html( $t->name ) );
+            if ( ! isset( $t->slug, $t->name ) ) { continue; }
+            $sel = selected( $current_tag, (string) $t->slug, false );
+            $tag_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( (string) $t->slug ), $sel, esc_html( (string) $t->name ) );
         }
 
         $year_opts = '';
         foreach ( (array) $years as $y ) {
-            $sel        = selected( $current_year, (string) $y, false );
-            $year_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $y ), $sel, esc_html( $y ) );
+            $y = (int) $y; if ( $y <= 0 ) { continue; }
+            $sel = selected( $current_year, (string) $y, false );
+            $year_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( (string) $y ), $sel, esc_html( (string) $y ) );
         }
 
         $sort_opts = '';
-        $sort_map  = [
-            'newest' => 'Newest',
-            'oldest' => 'Oldest',
-            'title'  => 'Title A-Z',
-        ];
-        foreach ( $sort_map as $key => $label ) {
-            $sel        = selected( $current_sort, $key, false );
+        foreach ( [ 'newest' => 'Newest', 'oldest' => 'Oldest', 'title' => 'Title A-Z' ] as $key => $label ) {
+            $sel = selected( $current_sort, $key, false );
             $sort_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $key ), $sel, esc_html( $label ) );
         }
 
         $search_keep = '';
-        if ( isset( $_GET['s'] ) && '' !== $_GET['s'] ) {
+        if ( isset( $_GET['s'] ) && $_GET['s'] !== '' ) {
             $search_keep = sprintf( '<input type="hidden" name="s" value="%s" />', esc_attr( sanitize_text_field( wp_unslash( $_GET['s'] ) ) ) );
         }
 
         $html = str_replace(
             [ '%ARCHIVE_URL%', '%TYPE_OPTIONS%', '%TAG_OPTIONS%', '%YEAR_OPTIONS%', '%SORT_OPTIONS%', '%SEARCH_KEEP%' ],
             [ esc_url( $archive_url ), $type_opts, $tag_opts, $year_opts, $sort_opts, $search_keep ],
-            $html
+            $template
         );
 
         return $html;
     }
     add_shortcode( 'aco_resources_filter', 'aco_re_shortcode_resources_filter' );
 }
-?>
