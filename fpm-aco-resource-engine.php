@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.6
+ * Version:         1.17.7
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1556,17 +1556,17 @@ function aco_re_render_log_viewer_page_final() {
 if ( ! function_exists( 'aco_re_shortcode_resources_filter' ) ) {
     /**
      * Renders Type, Tag, Year and Sort controls that submit to the Resource archive.
-     * Uses non-reserved query vars: r_type, r_tag, r_year, r_sort.
+     * Uses non-reserved query vars: rtype, rtag, ryear, rsort.
      */
     function aco_re_shortcode_resources_filter( $atts = [] ) {
         $archive_url = get_post_type_archive_link( 'resource' );
         if ( ! $archive_url ) { return ''; }
 
         // Current values from the URL (GET) using namespaced keys.
-        $current_type = isset( $_GET['r_type'] ) ? sanitize_text_field( wp_unslash( $_GET['r_type'] ) ) : '';
-        $current_tag  = isset( $_GET['r_tag'] )  ? sanitize_text_field( wp_unslash( $_GET['r_tag'] ) )  : '';
-        $current_year = isset( $_GET['r_year'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['r_year'] ) : '';
-        $current_sort = isset( $_GET['r_sort'] ) ? sanitize_key( wp_unslash( $_GET['r_sort'] ) ) : 'newest';
+        $current_type = isset( $_GET['rtype'] ) ? sanitize_title( wp_unslash( $_GET['rtype'] ) ) : '';
+        $current_tag  = isset( $_GET['rtag'] )  ? sanitize_title( wp_unslash( $_GET['rtag'] ) )  : '';
+        $current_year = isset( $_GET['ryear'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['ryear'] ) : '';
+        $current_sort = isset( $_GET['rsort'] ) ? sanitize_key( wp_unslash( $_GET['rsort'] ) ) : 'newest';
 
         // Terms for selects.
         $type_terms = get_terms( [ 'taxonomy' => 'resource_type',  'hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC' ] );
@@ -1580,28 +1580,28 @@ if ( ! function_exists( 'aco_re_shortcode_resources_filter' ) ) {
 <form class="aco-resources-filter-wrap" method="get" action="%ARCHIVE_URL%">
     <div class="aco-filter-group">
         <label for="aco_filter_type">Type</label>
-        <select id="aco_filter_type" name="r_type">
+        <select id="aco_filter_type" name="rtype">
             <option value="">All types</option>
             %TYPE_OPTIONS%
         </select>
     </div>
     <div class="aco-filter-group">
         <label for="aco_filter_tag">Tag</label>
-        <select id="aco_filter_tag" name="r_tag">
+        <select id="aco_filter_tag" name="rtag">
             <option value="">All tags</option>
             %TAG_OPTIONS%
         </select>
     </div>
     <div class="aco-filter-group">
         <label for="aco_filter_year">Year</label>
-        <select id="aco_filter_year" name="r_year">
+        <select id="aco_filter_year" name="ryear">
             <option value="">Any year</option>
             %YEAR_OPTIONS%
         </select>
     </div>
     <div class="aco-filter-group">
         <label for="aco_filter_sort">Sort</label>
-        <select id="aco_filter_sort" name="r_sort">
+        <select id="aco_filter_sort" name="rsort">
             %SORT_OPTIONS%
         </select>
     </div>
@@ -1663,82 +1663,103 @@ HTML;
     add_shortcode( 'aco_resources_filter', 'aco_re_shortcode_resources_filter' );
 }
 
-// --- Archive query shaping from namespaced GET vars (r_type, r_tag, r_year, r_sort) ---
-if ( ! function_exists( 'aco_re_register_archive_query_vars' ) ) {
-    function aco_re_register_archive_query_vars( $vars ) {
-        $vars[] = 'r_type';
-        $vars[] = 'r_tag';
-        $vars[] = 'r_year';
-        $vars[] = 'r_sort';
-        return $vars;
+// --- Resource Archive: query shaping (facets + sort) ---
+add_action( 'pre_get_posts', function( WP_Query $q ) {
+    if ( is_admin() || ! $q->is_main_query() || ! $q->is_post_type_archive( 'resource' ) ) {
+        return;
     }
-    add_filter( 'query_vars', 'aco_re_register_archive_query_vars' );
-}
 
-if ( ! function_exists( 'aco_re_apply_archive_filters_from_querystring' ) ) {
-    /**
-     * Apply Resource archive filters to BOTH the main archive query and secondary queries
-     * (e.g., Kadence Advanced Query Loop) when post_type includes 'resource'.
-     * - Year filter and sorting use _aco_document_date meta (DATE type).
-     */
-    function aco_re_apply_archive_filters_from_querystring( $q ) {
-        if ( is_admin() ) { return; }
+    // Show only published items on the public archive.
+    $q->set( 'post_status', 'publish' );
 
-        // Read from $_GET so secondary queries can see the same inputs.
-        $r_type = isset( $_GET['r_type'] ) ? sanitize_title( wp_unslash( $_GET['r_type'] ) ) : '';
-        $r_tag  = isset( $_GET['r_tag'] )  ? sanitize_title( wp_unslash( $_GET['r_tag'] ) )  : '';
-        $r_year = isset( $_GET['r_year'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['r_year'] ) : '';
-        $r_sort = isset( $_GET['r_sort'] ) ? sanitize_key( wp_unslash( $_GET['r_sort'] ) ) : '';
-        $has_params = ( $r_type !== '' || $r_tag !== '' || $r_year !== '' || $r_sort !== '' );
+    // Non-core keys (avoid collisions with WP vars like 'tag'/'year').
+    $type_in = isset( $_GET['rtype'] ) ? (string) wp_unslash( $_GET['rtype'] ) : '';
+    $tag_in  = isset( $_GET['rtag'] )  ? (string) wp_unslash( $_GET['rtag'] )  : '';
+    $year    = isset( $_GET['ryear'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['ryear'] ) : '';
+    $sort    = isset( $_GET['rsort'] ) ? sanitize_key( (string) $_GET['rsort'] ) : 'newest';
 
-        // Only touch Resource contexts: either the archive OR any query whose post_type includes 'resource'.
-        $pt = $q->get( 'post_type' );
-        $is_resource_query = $q->is_post_type_archive( 'resource' )
-            || ( $pt && ( ( is_array( $pt ) && in_array( 'resource', $pt, true ) ) || $pt === 'resource' ) );
-        if ( ! $is_resource_query && ! ( $has_params && $q->is_main_query() ) ) { return; }
-
-        // Ensure post_type is resource when filters are used.
-        if ( ! $pt ) { $q->set( 'post_type', 'resource' ); }
-
-        // Taxonomy filters.
-        $tax_query = (array) $q->get( 'tax_query' );
-        if ( $r_type !== '' ) {
-            $tax_query[] = [ 'taxonomy' => 'resource_type', 'field' => 'slug', 'terms' => [ $r_type ] ];
-        }
-        if ( $r_tag !== '' ) {
-            $tax_query[] = [ 'taxonomy' => 'universal_tag', 'field' => 'slug', 'terms' => [ $r_tag ] ];
-        }
-        if ( ! empty( $tax_query ) ) { $q->set( 'tax_query', $tax_query ); }
-
-        // Year filter on meta date (document date), not published date.
-        if ( $r_year !== '' ) {
-            $q->set( 'meta_query', [ [
-                'key'     => '_aco_document_date',
-                'value'   => [ sprintf( '%s-01-01', $r_year ), sprintf( '%s-12-31', $r_year ) ],
-                'compare' => 'BETWEEN',
-                'type'    => 'DATE',
-            ] ] );
-        }
-
-        // Sorting: newest/oldest by document date; title A–Z otherwise.
-        switch ( $r_sort ) {
-            case 'oldest':
-                $q->set( 'meta_key', '_aco_document_date' );
-                $q->set( 'meta_type', 'DATE' );
-                $q->set( 'orderby', 'meta_value' );
-                $q->set( 'order', 'ASC' );
-                break;
-            case 'title':
-                $q->set( 'orderby', 'title' );
-                $q->set( 'order', 'ASC' );
-                break;
-            default: // newest
-                $q->set( 'meta_key', '_aco_document_date' );
-                $q->set( 'meta_type', 'DATE' );
-                $q->set( 'orderby', 'meta_value' );
-                $q->set( 'order', 'DESC' );
-                break;
+    // Facets.
+    $tax_query = [];
+    if ( '' !== $type_in ) {
+        $type_slugs = array_values( array_filter( array_map( 'sanitize_title', explode( ',', $type_in ) ) ) );
+        if ( $type_slugs ) {
+            $tax_query[] = [ 'taxonomy' => 'resource_type', 'field' => 'slug', 'terms' => $type_slugs, 'operator' => 'IN' ];
         }
     }
-    add_action( 'pre_get_posts', 'aco_re_apply_archive_filters_from_querystring', 11 );
-}
+    if ( '' !== $tag_in ) {
+        $tag_slugs = array_values( array_filter( array_map( 'sanitize_title', explode( ',', $tag_in ) ) ) );
+        if ( $tag_slugs ) {
+            $tax_query[] = [ 'taxonomy' => 'universal_tag', 'field' => 'slug', 'terms' => $tag_slugs, 'operator' => 'IN' ];
+        }
+    }
+    if ( $tax_query ) {
+        $q->set( 'tax_query', $tax_query );
+    }
+
+    // Year filter relies on document date meta; when set, it's an explicit filter.
+    $meta_query = [];
+    if ( $year !== '' && 4 === strlen( $year ) ) {
+        $meta_query[] = [
+            'key'     => '_aco_document_date',
+            'value'   => [ "{$year}-01-01", "{$year}-12-31" ],
+            'compare' => 'BETWEEN',
+            'type'    => 'DATE',
+        ];
+    }
+    if ( $meta_query ) {
+        $q->set( 'meta_query', $meta_query );
+    }
+
+    // Base order uses post_date; an order-by helper below promotes items that HAVE doc date
+    // and pushes UNDATED to the end, without excluding them.
+    switch ( $sort ) {
+        case 'oldest':
+            $q->set( 'orderby', 'date' );
+            $q->set( 'order', 'ASC' );
+            break;
+        case 'title':
+            $q->set( 'orderby', 'title' );
+            $q->set( 'order', 'ASC' );
+            break;
+        case 'newest':
+        default:
+            $q->set( 'orderby', 'date' );
+            $q->set( 'order', 'DESC' );
+            break;
+    }
+
+    // Flag for the posts_clauses helper to implement 'undated last' using a LEFT JOIN.
+    $q->set( '__aco_sort', $sort );
+
+    // Page size default.
+    if ( ! $q->get( 'posts_per_page' ) ) {
+        $q->set( 'posts_per_page', 12 );
+    }
+}, 11 );
+
+// --- Resource Archive: undated-last ordering helper ---
+add_filter( 'posts_clauses', function( $clauses, WP_Query $q ) {
+    if ( is_admin() || ! $q->is_main_query() || ! $q->is_post_type_archive( 'resource' ) ) {
+        return $clauses;
+    }
+    $sort = $q->get( '__aco_sort' );
+    if ( ! in_array( $sort, [ 'newest', 'oldest' ], true ) ) {
+        return $clauses; // Only adjust for date-based sorts
+    }
+
+    global $wpdb;
+    $dir = ( 'oldest' === $sort ) ? 'ASC' : 'DESC';
+
+    // LEFT JOIN the document-date meta so posts missing it remain in the result set.
+    if ( strpos( $clauses['join'], ' aco_doc ' ) === false ) {
+        $clauses['join'] .= " LEFT JOIN {$wpdb->postmeta} AS aco_doc ON ( {$wpdb->posts}.ID = aco_doc.post_id AND aco_doc.meta_key = '_aco_document_date' ) ";
+    }
+
+    // Put undated (NULL/empty) last, then sort by document date, then fallback to post_date.
+    $orderby  = "CASE WHEN aco_doc.meta_value IS NULL OR aco_doc.meta_value = '' THEN 1 ELSE 0 END ASC";
+    $orderby .= ", aco_doc.meta_value {$dir}";
+    $orderby .= ", {$wpdb->posts}.post_date {$dir}";
+    $clauses['orderby'] = $orderby;
+
+    return $clauses;
+}, 11, 2 );
