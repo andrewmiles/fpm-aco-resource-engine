@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.17.4
+ * Version:         1.17.5
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1555,19 +1555,18 @@ function aco_re_render_log_viewer_page_final() {
 // --- Shortcode: Resources filter bar [aco_resources_filter] ---
 if ( ! function_exists( 'aco_re_shortcode_resources_filter' ) ) {
     /**
-     * Shortcode: [aco_resources_filter]
      * Renders Type, Tag, Year and Sort controls that submit to the Resource archive.
-     * Safe implementation: single PHP context (no tag flips), nowdoc template, full escaping.
+     * Uses non-reserved query vars: r_type, r_tag, r_year, r_sort.
      */
     function aco_re_shortcode_resources_filter( $atts = [] ) {
         $archive_url = get_post_type_archive_link( 'resource' );
         if ( ! $archive_url ) { return ''; }
 
-        // Current values from the URL (GET).
-        $current_type = isset( $_GET['type'] ) ? sanitize_text_field( wp_unslash( $_GET['type'] ) ) : '';
-        $current_tag  = isset( $_GET['tag'] )  ? sanitize_text_field( wp_unslash( $_GET['tag'] ) )  : '';
-        $current_year = isset( $_GET['year'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['year'] ) : '';
-        $current_sort = isset( $_GET['sort'] ) ? sanitize_key( wp_unslash( $_GET['sort'] ) ) : 'newest';
+        // Current values from the URL (GET) using namespaced keys.
+        $current_type = isset( $_GET['r_type'] ) ? sanitize_text_field( wp_unslash( $_GET['r_type'] ) ) : '';
+        $current_tag  = isset( $_GET['r_tag'] )  ? sanitize_text_field( wp_unslash( $_GET['r_tag'] ) )  : '';
+        $current_year = isset( $_GET['r_year'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['r_year'] ) : '';
+        $current_sort = isset( $_GET['r_sort'] ) ? sanitize_key( wp_unslash( $_GET['r_sort'] ) ) : 'newest';
 
         // Terms for selects.
         $type_terms = get_terms( [ 'taxonomy' => 'resource_type',  'hide_empty' => true, 'orderby' => 'name', 'order' => 'ASC' ] );
@@ -1581,28 +1580,28 @@ if ( ! function_exists( 'aco_re_shortcode_resources_filter' ) ) {
 <form class="aco-resources-filter-wrap" method="get" action="%ARCHIVE_URL%">
     <div class="aco-filter-group">
         <label for="aco_filter_type">Type</label>
-        <select id="aco_filter_type" name="type">
+        <select id="aco_filter_type" name="r_type">
             <option value="">All types</option>
             %TYPE_OPTIONS%
         </select>
     </div>
     <div class="aco-filter-group">
         <label for="aco_filter_tag">Tag</label>
-        <select id="aco_filter_tag" name="tag">
+        <select id="aco_filter_tag" name="r_tag">
             <option value="">All tags</option>
             %TAG_OPTIONS%
         </select>
     </div>
     <div class="aco-filter-group">
         <label for="aco_filter_year">Year</label>
-        <select id="aco_filter_year" name="year">
+        <select id="aco_filter_year" name="r_year">
             <option value="">Any year</option>
             %YEAR_OPTIONS%
         </select>
     </div>
     <div class="aco-filter-group">
         <label for="aco_filter_sort">Sort</label>
-        <select id="aco_filter_sort" name="sort">
+        <select id="aco_filter_sort" name="r_sort">
             %SORT_OPTIONS%
         </select>
     </div>
@@ -1644,7 +1643,8 @@ HTML;
         }
 
         $sort_opts = '';
-        foreach ( [ 'newest' => 'Newest', 'oldest' => 'Oldest', 'title' => 'Title A-Z' ] as $key => $label ) {
+        $sort_map  = [ 'newest' => 'Newest', 'oldest' => 'Oldest', 'title' => 'Title A-Z' ];
+        foreach ( $sort_map as $key => $label ) {
             $sel = selected( $current_sort, $key, false );
             $sort_opts .= sprintf( '<option value="%s" %s>%s</option>', esc_attr( $key ), $sel, esc_html( $label ) );
         }
@@ -1654,13 +1654,69 @@ HTML;
             $search_keep = sprintf( '<input type="hidden" name="s" value="%s" />', esc_attr( sanitize_text_field( wp_unslash( $_GET['s'] ) ) ) );
         }
 
-        $html = str_replace(
+        return str_replace(
             [ '%ARCHIVE_URL%', '%TYPE_OPTIONS%', '%TAG_OPTIONS%', '%YEAR_OPTIONS%', '%SORT_OPTIONS%', '%SEARCH_KEEP%' ],
             [ esc_url( $archive_url ), $type_opts, $tag_opts, $year_opts, $sort_opts, $search_keep ],
             $template
         );
-
-        return $html;
     }
     add_shortcode( 'aco_resources_filter', 'aco_re_shortcode_resources_filter' );
+}
+
+// --- Archive query shaping from namespaced GET vars (r_type, r_tag, r_year, r_sort) ---
+if ( ! function_exists( 'aco_re_register_archive_query_vars' ) ) {
+    function aco_re_register_archive_query_vars( $vars ) {
+        $vars[] = 'r_type';
+        $vars[] = 'r_tag';
+        $vars[] = 'r_year';
+        $vars[] = 'r_sort';
+        return $vars;
+    }
+    add_filter( 'query_vars', 'aco_re_register_archive_query_vars' );
+}
+
+if ( ! function_exists( 'aco_re_apply_archive_filters_from_querystring' ) ) {
+    function aco_re_apply_archive_filters_from_querystring( $q ) {
+        if ( is_admin() || ! $q->is_main_query() ) { return; }
+
+        // Apply on resource archive OR whenever our params are present.
+        $has_params = ( $q->get( 'r_type' ) || $q->get( 'r_tag' ) || $q->get( 'r_year' ) || $q->get( 'r_sort' ) );
+        if ( ! $q->is_post_type_archive( 'resource' ) && ! $has_params ) { return; }
+
+        // Force the context to resource posts when our params are used.
+        $q->set( 'post_type', 'resource' );
+
+        // Tax filters.
+        $tax_query = [];
+        $r_type = sanitize_text_field( (string) $q->get( 'r_type' ) );
+        if ( $r_type !== '' ) {
+            $tax_query[] = [ 'taxonomy' => 'resource_type', 'field' => 'slug', 'terms' => [ $r_type ] ];
+        }
+        $r_tag = sanitize_text_field( (string) $q->get( 'r_tag' ) );
+        if ( $r_tag !== '' ) {
+            $tax_query[] = [ 'taxonomy' => 'universal_tag', 'field' => 'slug', 'terms' => [ $r_tag ] ];
+        }
+        if ( ! empty( $tax_query ) ) { $q->set( 'tax_query', $tax_query ); }
+
+        // Year → published year.
+        $r_year = preg_replace( '/[^0-9]/', '', (string) $q->get( 'r_year' ) );
+        if ( $r_year !== '' ) { $q->set( 'date_query', [ [ 'year' => (int) $r_year ] ] ); }
+
+        // Sorting.
+        $sort = sanitize_key( (string) $q->get( 'r_sort' ) );
+        switch ( $sort ) {
+            case 'oldest':
+                $q->set( 'orderby', 'date' );
+                $q->set( 'order', 'ASC' );
+                break;
+            case 'title':
+                $q->set( 'orderby', 'title' );
+                $q->set( 'order', 'ASC' );
+                break;
+            default:
+                $q->set( 'orderby', 'date' );
+                $q->set( 'order', 'DESC' );
+        }
+    }
+    add_action( 'pre_get_posts', 'aco_re_apply_archive_filters_from_querystring', 11 );
 }
