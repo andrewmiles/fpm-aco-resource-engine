@@ -2,7 +2,7 @@
 /**
  * Plugin Name:     1 - FPM - ACO Resource Engine
  * Description:     Core functionality for the ACO Resource Library, including failover, sync and content models.
- * Version:         1.20.2
+ * Version:         1.20.3
  * Author:          FPM, AM
  * Requires at least: 6.3
  * Requires PHP:      7.4
@@ -1057,6 +1057,8 @@ function aco_re_reject_oversized_requests( WP_REST_Request $request ) {
     return true;
 }
 
+// --- Webhook & Sync Processing ---
+
 function aco_re_webhook_permission_callback( WP_REST_Request $request ) {
     // 1. First, reject any requests that are excessively large.
     $size_check = aco_re_reject_oversized_requests( $request );
@@ -1064,83 +1066,91 @@ function aco_re_webhook_permission_callback( WP_REST_Request $request ) {
         return $size_check;
     }
 
-    // 2. Proceed with the original validation logic.
+    // 2. Require JSON content-type
     $content_type = aco_re_get_header( $request, 'content-type' );
     if ( $content_type && stripos( $content_type, 'application/json' ) === false ) {
-        return new WP_Error( 'invalid_content_type', 'Content-Type must be application/json.', [ 'status' => 415 ] );
+        return new WP_Error(
+            'invalid_content_type',
+            'Content-Type must be application/json.',
+            [ 'status' => 415 ]
+        );
     }
 
-    $timestamp_raw = aco_re_get_header( $request, 'x-aco-timestamp' );
-    $signature_raw = aco_re_get_header( $request, 'x-aco-signature' );
-    $body          = $request->get_body();
-
-    if ( ! $timestamp_raw || ! $signature_raw ) {
-        return new WP_Error( 'missing_headers', 'Missing required security headers.', [ 'status' => 400 ] );
+    // 3. Simple Bearer-token auth using the primary secret
+    $auth_header = $request->get_header( 'authorization' );
+    if ( ! $auth_header ) {
+        return new WP_Error(
+            'aco_forbidden',
+            'Missing Authorization header.',
+            [ 'status' => 403 ]
+        );
     }
 
-    $timestamp_raw = trim( (string) $timestamp_raw );
-    if ( ! ctype_digit( $timestamp_raw ) ) {
-        return new WP_Error( 'invalid_timestamp', 'Timestamp header must be numeric.', [ 'status' => 400 ] );
+    $expected = 'Bearer ' . ACO_WEBHOOK_SECRET_PRIMARY;
+
+    if ( ! hash_equals( $expected, $auth_header ) ) {
+        return new WP_Error(
+            'aco_forbidden',
+            'Invalid Airtable token.',
+            [ 'status' => 403 ]
+        );
     }
 
-    $ts_num = (float) $timestamp_raw;
-    $ts_sec = ( $ts_num >= 1000000000000 ) ? ( $ts_num / 1000.0 ) : $ts_num;
-    $now    = (float) current_time( 'timestamp', true );
-
-    if ( ( $now - $ts_sec ) > 300.0 || ( $ts_sec - $now ) > 60.0 ) {
-        return new WP_Error( 'stale_request', 'The webhook timestamp is outside the allowed window.', [ 'status' => 400 ] );
-    }
-
-    $payload = $timestamp_raw . '.' . $body;
-    $sig_bin = aco_re_decode_signature_to_binary( $signature_raw );
-    if ( null === $sig_bin ) {
-        return new WP_Error( 'bad_signature_format', 'The webhook signature format is invalid.', [ 'status' => 400 ] );
-    }
-
-    list( $primary_secret, $secondary_secret ) = aco_re_get_webhook_secrets();
-    if ( ! $primary_secret && ! $secondary_secret ) {
-        return new WP_Error( 'server_misconfig', 'Webhook secrets are not configured.', [ 'status' => 500 ] );
-    }
-
-    $expected_primary   = $primary_secret   ? hash_hmac( 'sha256', $payload, $primary_secret, true )   : null;
-    $expected_secondary = $secondary_secret ? hash_hmac( 'sha256', $payload, $secondary_secret, true ) : null;
-
-    $is_valid = false;
-    if ( $expected_primary && hash_equals( $expected_primary, $sig_bin ) ) {
-        $is_valid = true;
-    } elseif ( $expected_secondary && hash_equals( $expected_secondary, $sig_bin ) ) {
-        $is_valid = true;
-    }
-
-    if ( ! $is_valid ) {
-        return new WP_Error( 'bad_signature', 'The webhook signature is invalid.', [ 'status' => 403 ] );
-    }
-
-    if ( ! aco_re_prevent_replay( $sig_bin, 300 ) ) {
-        return new WP_Error( 'replay_detected', 'This webhook has already been processed.', [ 'status' => 409 ] );
-    }
-
+    // 4. All good
     return true;
 }
 
 function aco_re_enqueue_sync_job( array $payload ): bool {
     if ( function_exists( 'as_enqueue_async_action' ) ) {
-        as_enqueue_async_action( 'aco_re_process_resource_sync', [ 'payload' => $payload ], 'aco_resource_sync' );
+        as_enqueue_async_action(
+            'aco_re_process_resource_sync',
+            [ 'payload' => $payload ],
+            'aco_resource_sync'
+        );
         return true;
     }
-    return (bool) wp_schedule_single_event( time(), 'aco_re_process_resource_sync', [ [ 'payload' => $payload ] ] );
+
+    return (bool) wp_schedule_single_event(
+        time(),
+        'aco_re_process_resource_sync',
+        [ [ 'payload' => $payload ] ]
+    );
 }
 
 function aco_re_handle_webhook_sync( WP_REST_Request $request ) {
+    // At this point, the permission callback has already validated:
+    // - request size
+    // - content type
+    // - Authorization: Bearer <secret>
+
     $payload = $request->get_json_params();
+
     if ( empty( $payload ) || ! isset( $payload['record_id'] ) ) {
-        return new WP_REST_Response( [ 'status' => 'bad_request', 'message' => __( 'Missing or invalid payload.', 'fpm-aco-resource-engine' ) ], 400 );
+        return new WP_REST_Response(
+            [
+                'status'  => 'bad_request',
+                'message' => __( 'Missing or invalid payload.', 'fpm-aco-resource-engine' ),
+            ],
+            400
+        );
     }
+
     $enqueued = aco_re_enqueue_sync_job( $payload );
+
     if ( ! $enqueued ) {
-        return new WP_REST_Response( [ 'status' => 'error', 'message' => __( 'Could not queue the sync job.', 'fpm-aco-resource-engine' ) ], 500 );
+        return new WP_REST_Response(
+            [
+                'status'  => 'error',
+                'message' => __( 'Could not queue the sync job.', 'fpm-aco-resource-engine' ),
+            ],
+            500
+        );
     }
-    return new WP_REST_Response( [ 'status' => 'accepted' ], 202 );
+
+    return new WP_REST_Response(
+        [ 'status' => 'accepted' ],
+        202
+    );
 }
 
 /**
@@ -3350,3 +3360,157 @@ function aco_re_register_searchwp_engine_placeholder( $engines ) {
     return $engines;
 }
 add_filter( 'searchwp\engines', 'aco_re_register_searchwp_engine_placeholder', 0 );
+
+// --- Shortcode: Resources filter bar [aco_resources_filter] ---
+if ( ! function_exists( 'aco_re_shortcode_resources_filter' ) ) {
+    /**
+     * Renders Type, Tag, Year and Sort controls that submit to the Resource archive.
+     * - No PHP open/close flips; uses nowdoc + string substitution.
+     * - Escapes all dynamic values.
+     * - Preserves existing search (s).
+     */
+    function aco_re_shortcode_resources_filter( $atts = [] ) {
+        $archive_url = get_post_type_archive_link( 'resource' );
+        if ( ! $archive_url ) { return ''; }
+
+        // Current values from the URL (GET).
+        $current_type = isset( $_GET['type'] ) ? sanitize_text_field( wp_unslash( $_GET['type'] ) ) : '';
+        $current_tag  = isset( $_GET['tag'] )  ? sanitize_text_field( wp_unslash( $_GET['tag'] ) )  : '';
+        $current_year = isset( $_GET['year'] ) ? preg_replace( '/[^0-9]/', '', (string) $_GET['year'] ) : '';
+        $current_sort = isset( $_GET['sort'] ) ? sanitize_key( wp_unslash( $_GET['sort'] ) ) : 'newest';
+
+        // Terms for selects.
+        $type_terms = get_terms( [
+            'taxonomy'   => 'resource_type',
+            'hide_empty' => true,
+            'orderby'    => 'name',
+            'order'      => 'ASC',
+        ] );
+        if ( is_wp_error( $type_terms ) ) { $type_terms = []; }
+
+        $tag_terms = get_terms( [
+            'taxonomy'   => 'universal_tag',
+            'hide_empty' => true,
+            'orderby'    => 'name',
+            'order'      => 'ASC',
+        ] );
+        if ( is_wp_error( $tag_terms ) ) { $tag_terms = []; }
+
+        $years = function_exists( 'aco_re_get_available_resource_years' ) ? (array) aco_re_get_available_resource_years() : [];
+
+        $template = <<<'HTML'
+<form class="aco-resources-filter-wrap" method="get" action="%ARCHIVE_URL%">
+    <div class="aco-filter-group">
+        <label for="aco_filter_type">Type</label>
+        <select id="aco_filter_type" name="type">
+            <option value="">All types</option>
+            %TYPE_OPTIONS%
+        </select>
+    </div>
+    <div class="aco-filter-group">
+        <label for="aco_filter_tag">Tag</label>
+        <select id="aco_filter_tag" name="tag">
+            <option value="">All tags</option>
+            %TAG_OPTIONS%
+        </select>
+    </div>
+    <div class="aco-filter-group">
+        <label for="aco_filter_year">Year</label>
+        <select id="aco_filter_year" name="year">
+            <option value="">Any year</option>
+            %YEAR_OPTIONS%
+        </select>
+    </div>
+    <div class="aco-filter-group">
+        <label for="aco_filter_sort">Sort</label>
+        <select id="aco_filter_sort" name="sort">
+            %SORT_OPTIONS%
+        </select>
+    </div>
+    %SEARCH_KEEP%
+    <input type="hidden" name="paged" value="1" />
+    <div class="aco-filter-actions">
+        <button type="submit" class="button">Apply</button>
+        <a class="aco-filter-reset" href="%ARCHIVE_URL%">Clear</a>
+    </div>
+    <style>
+        .aco-resources-filter-wrap{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin:0 0 16px}
+        .aco-resources-filter-wrap .aco-filter-group{display:flex;flex-direction:column;min-width:160px}
+        .aco-resources-filter-wrap .aco-filter-actions{display:flex;gap:8px}
+        .aco-resources-filter-wrap select,.aco-resources-filter-wrap button{min-height:40px}
+    </style>
+</form>
+HTML;
+
+        // Build options safely.
+        $type_opts = '';
+        foreach ( (array) $type_terms as $t ) {
+            if ( ! isset( $t->slug, $t->name ) ) { continue; }
+            $sel = selected( $current_type, (string) $t->slug, false );
+            $type_opts .= sprintf(
+                '<option value="%s" %s>%s</option>',
+                esc_attr( (string) $t->slug ),
+                $sel,
+                esc_html( (string) $t->name )
+            );
+        }
+
+        $tag_opts = '';
+        foreach ( (array) $tag_terms as $t ) {
+            if ( ! isset( $t->slug, $t->name ) ) { continue; }
+            $sel = selected( $current_tag, (string) $t->slug, false );
+            $tag_opts .= sprintf(
+                '<option value="%s" %s>%s</option>',
+                esc_attr( (string) $t->slug ),
+                $sel,
+                esc_html( (string) $t->name )
+            );
+        }
+
+        $year_opts = '';
+        foreach ( (array) $years as $y ) {
+            $y = (int) $y;
+            if ( $y <= 0 ) { continue; }
+            $sel = selected( $current_year, (string) $y, false );
+            $year_opts .= sprintf(
+                '<option value="%s" %s>%s</option>',
+                esc_attr( (string) $y ),
+                $sel,
+                esc_html( (string) $y )
+            );
+        }
+
+        $sort_opts = '';
+        $sort_map  = [
+            'newest' => 'Newest',
+            'oldest' => 'Oldest',
+            'title'  => 'Title A-Z',
+        ];
+        foreach ( $sort_map as $key => $label ) {
+            $sel = selected( $current_sort, $key, false );
+            $sort_opts .= sprintf(
+                '<option value="%s" %s>%s</option>',
+                esc_attr( $key ),
+                $sel,
+                esc_html( $label )
+            );
+        }
+
+        $search_keep = '';
+        if ( isset( $_GET['s'] ) && $_GET['s'] !== '' ) {
+            $search_keep = sprintf(
+                '<input type="hidden" name="s" value="%s" />',
+                esc_attr( sanitize_text_field( wp_unslash( $_GET['s'] ) ) )
+            );
+        }
+
+        $html = str_replace(
+            [ '%ARCHIVE_URL%', '%TYPE_OPTIONS%', '%TAG_OPTIONS%', '%YEAR_OPTIONS%', '%SORT_OPTIONS%', '%SEARCH_KEEP%' ],
+            [ esc_url( $archive_url ), $type_opts, $tag_opts, $year_opts, $sort_opts, $search_keep ],
+            $template
+        );
+
+        return $html;
+    }
+    add_shortcode( 'aco_resources_filter', 'aco_re_shortcode_resources_filter' );
+}
